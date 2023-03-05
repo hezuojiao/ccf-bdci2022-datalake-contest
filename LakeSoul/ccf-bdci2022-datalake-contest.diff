@@ -1,0 +1,2452 @@
+commit 48b517ebb4f9ce1c150abf5ed8d5cb12d77200f6
+Author: hezuojiao <hezuojiao@gmail.com>
+Date:   Sun Nov 13 11:53:38 2022 +0800
+
+    submit code
+
+diff --git a/lakesoul-spark/src/main/scala/com/dmetasoul/lakesoul/tables/LakeSoulTable.scala b/lakesoul-spark/src/main/scala/com/dmetasoul/lakesoul/tables/LakeSoulTable.scala
+index f422eeb..70c131e 100644
+--- a/lakesoul-spark/src/main/scala/com/dmetasoul/lakesoul/tables/LakeSoulTable.scala
++++ b/lakesoul-spark/src/main/scala/com/dmetasoul/lakesoul/tables/LakeSoulTable.scala
+@@ -262,6 +262,10 @@ class LakeSoulTable(df: => Dataset[Row], snapshotManagement: SnapshotManagement)
+     executeUpsert(this, source, condition)
+   }
+ 
++  def bulkUpsert(source: Seq[DataFrame]): Unit = {
++    executeBulkUpsert(this, source)
++  }
++
+   //by default, force perform compaction on whole table
+   def compaction(): Unit = {
+     compaction("", true, Map.empty[String, Any], "")
+diff --git a/lakesoul-spark/src/main/scala/com/dmetasoul/lakesoul/tables/execution/LakeSoulTableOperations.scala b/lakesoul-spark/src/main/scala/com/dmetasoul/lakesoul/tables/execution/LakeSoulTableOperations.scala
+index 2ff1a3e..ddc25c1 100644
+--- a/lakesoul-spark/src/main/scala/com/dmetasoul/lakesoul/tables/execution/LakeSoulTableOperations.scala
++++ b/lakesoul-spark/src/main/scala/com/dmetasoul/lakesoul/tables/execution/LakeSoulTableOperations.scala
+@@ -20,7 +20,7 @@ import com.dmetasoul.lakesoul.meta.MetaVersion
+ import com.dmetasoul.lakesoul.tables.LakeSoulTable
+ import org.apache.spark.sql.catalyst.analysis.UnresolvedAttribute
+ import org.apache.spark.sql.catalyst.expressions.Expression
+-import org.apache.spark.sql.catalyst.plans.logical.{Assignment, DeleteFromTable, LakeSoulUpsert, UpdateTable}
++import org.apache.spark.sql.catalyst.plans.logical.{Assignment, DeleteFromTable, LakeSoulBulkUpsert, LakeSoulUpsert, UpdateTable}
+ import org.apache.spark.sql.lakesoul.SnapshotManagement
+ import org.apache.spark.sql.lakesoul.commands._
+ import org.apache.spark.sql.lakesoul.exception.LakeSoulErrors
+@@ -97,6 +97,13 @@ trait LakeSoulTableOperations extends AnalysisHelper {
+ 
+   }
+ 
++  protected def executeBulkUpsert(targetTable: LakeSoulTable, sourceDF: Seq[DataFrame]): Unit = {
++    val target = targetTable.toDF.queryExecution.analyzed
++    val source = sourceDF.map(_.queryExecution.analyzed)
++    val upsert = LakeSoulBulkUpsert(target, source)
++    toDataset(sparkSession, PreprocessTableUpsert(sparkSession.sessionState.conf)(upsert))
++  }
++
+ 
+   protected def executeCompaction(df: DataFrame,
+                                   snapshotManagement: SnapshotManagement,
+diff --git a/lakesoul-spark/src/main/scala/org/apache/spark/sql/catalyst/plans/logical/LakeSoulUpsert.scala b/lakesoul-spark/src/main/scala/org/apache/spark/sql/catalyst/plans/logical/LakeSoulUpsert.scala
+index 6ad107d..a434171 100644
+--- a/lakesoul-spark/src/main/scala/org/apache/spark/sql/catalyst/plans/logical/LakeSoulUpsert.scala
++++ b/lakesoul-spark/src/main/scala/org/apache/spark/sql/catalyst/plans/logical/LakeSoulUpsert.scala
+@@ -28,3 +28,11 @@ case class LakeSoulUpsert(target: LogicalPlan,
+ 
+   override def output: Seq[Attribute] = Seq.empty
+ }
++
++case class LakeSoulBulkUpsert(target: LogicalPlan, source: Seq[LogicalPlan])
++    extends Command {
++
++  override def children: Seq[LogicalPlan] = Seq(target) ++ source
++
++  override def output: Seq[Attribute] = Seq.empty
++}
+diff --git a/lakesoul-spark/src/main/scala/org/apache/spark/sql/execution/datasources/v2/merge/parquet/MergeFilePartitionReaderFactory.scala b/lakesoul-spark/src/main/scala/org/apache/spark/sql/execution/datasources/v2/merge/parquet/MergeFilePartitionReaderFactory.scala
+index e14ae45..c756db7 100644
+--- a/lakesoul-spark/src/main/scala/org/apache/spark/sql/execution/datasources/v2/merge/parquet/MergeFilePartitionReaderFactory.scala
++++ b/lakesoul-spark/src/main/scala/org/apache/spark/sql/execution/datasources/v2/merge/parquet/MergeFilePartitionReaderFactory.scala
+@@ -19,11 +19,13 @@ package org.apache.spark.sql.execution.datasources.v2.merge.parquet
+ import org.apache.spark.sql.catalyst.InternalRow
+ import org.apache.spark.sql.connector.read.{InputPartition, PartitionReader, PartitionReaderFactory}
+ import org.apache.spark.sql.execution.datasources.v2.merge.parquet.batch.MergeParquetSingletonFilePartitionByBatchFile
+-import org.apache.spark.sql.execution.datasources.v2.merge.parquet.batch.merge_operator.{MergeOperator, MergeParquetFileWithOperatorPartitionByBatchFile}
++import org.apache.spark.sql.execution.datasources.v2.merge.parquet.batch.merge_operator.{FastMergeReader, MergeOperator, MergeParquetFileWithOperatorPartitionByBatchFile}
+ import org.apache.spark.sql.execution.datasources.v2.merge.{MergeFilePartition, MergeFilePartitionReader, MergePartitionedFile, MergePartitionedFileReader}
+ import org.apache.spark.sql.vectorized.ColumnarBatch
+ 
+-abstract class MergeFilePartitionReaderFactory(mergeOperatorInfo: Map[String, MergeOperator[Any]], defaultMergeOp: MergeOperator[Any])
++abstract class MergeFilePartitionReaderFactory(
++    mergeOperatorInfo: Map[String, MergeOperator[Any]],
++    defaultMergeOp: MergeOperator[Any])
+   extends PartitionReaderFactory {
+ 
+   override def createReader(partition: InputPartition): PartitionReader[InternalRow] = {
+@@ -38,6 +40,8 @@ abstract class MergeFilePartitionReaderFactory(mergeOperatorInfo: Map[String, Me
+     val mergeReader =
+       if (filePartition.isSingleFile) {
+         new MergeParquetSingletonFilePartitionByBatchFile[InternalRow](iter)
++      } else if (true) { // replace it by spark session configure
++        new FastMergeReader[InternalRow](iter, mergeOperatorInfo)
+       } else {
+         new MergeParquetFileWithOperatorPartitionByBatchFile[InternalRow](iter, mergeOperatorInfo, defaultMergeOp)
+       }
+diff --git a/lakesoul-spark/src/main/scala/org/apache/spark/sql/execution/datasources/v2/merge/parquet/batch/MergeHeapCommon.scala b/lakesoul-spark/src/main/scala/org/apache/spark/sql/execution/datasources/v2/merge/parquet/batch/MergeHeapCommon.scala
+index e118086..6cce2bc 100644
+--- a/lakesoul-spark/src/main/scala/org/apache/spark/sql/execution/datasources/v2/merge/parquet/batch/MergeHeapCommon.scala
++++ b/lakesoul-spark/src/main/scala/org/apache/spark/sql/execution/datasources/v2/merge/parquet/batch/MergeHeapCommon.scala
+@@ -70,6 +70,13 @@ trait MergeHeapCommon {
+     }
+   }
+ 
++  val fastCmpT = new Comparator[heapType] {
++    override def compare(o1: (Long, BufferedIterator[(InternalRow, Int)]),
++                         o2: (Long, BufferedIterator[(InternalRow, Int)])): Int = {
++      val cmp1 = o1._2.head._1.getUTF8String(0).compareTo(o2._2.head._1.getUTF8String(0))
++      if (cmp1 == 0) { -o1._1.compareTo(o2._1) } else { cmp1 }
++    }
++  }
+ }
+ 
+ class MergeOptimizeHeap(versionKey: Map[Long, Array[KeyIndex]]) extends MergeHeapCommon {
+@@ -100,6 +107,35 @@ class MergeOptimizeHeap(versionKey: Map[Long, Array[KeyIndex]]) extends MergeHea
+ 
+ }
+ 
++
++class FastMergeOptimizeHeap() extends MergeHeapCommon {
++
++  override val versionKeyInfoMap = Map.empty[Long, Array[KeyIndex]]
++
++  private val mergeFileHeap = new MergeHeap[heapType](fastCmpT)
++
++  /**
++   * Init merge heap, add each (write_version->bufferedIterator) into heap.
++   *
++   * @param fileInfoSeq (write_version, rowIterator().zipWithIndex.buffered)
++   */
++  def enqueueBySeq(fileInfoSeq: Seq[(Long, BufferedIterator[(InternalRow, Int)])]): Unit = {
++    fileInfoSeq.foreach(itr => mergeFileHeap.add(itr))
++  }
++
++  def enqueue(fileInfo: (Long, BufferedIterator[(InternalRow, Int)])): Unit =
++    mergeFileHeap.putBack(fileInfo)
++
++  def dequeue(): (Long, BufferedIterator[(InternalRow, Int)]) = mergeFileHeap.peek()
++
++  def poll(): Unit = mergeFileHeap.poll()
++
++  def isEmpty: Boolean = mergeFileHeap.isEmpty
++
++  def nonEmpty: Boolean = !isEmpty
++
++}
++
+ class MergePriorityQ(versionKey: Map[Long, Array[KeyIndex]]) extends MergeHeapCommon {
+ 
+   override val versionKeyInfoMap = versionKey
+diff --git a/lakesoul-spark/src/main/scala/org/apache/spark/sql/execution/datasources/v2/merge/parquet/batch/MergeUtils.scala b/lakesoul-spark/src/main/scala/org/apache/spark/sql/execution/datasources/v2/merge/parquet/batch/MergeUtils.scala
+index 266597b..a839355 100644
+--- a/lakesoul-spark/src/main/scala/org/apache/spark/sql/execution/datasources/v2/merge/parquet/batch/MergeUtils.scala
++++ b/lakesoul-spark/src/main/scala/org/apache/spark/sql/execution/datasources/v2/merge/parquet/batch/MergeUtils.scala
+@@ -21,6 +21,7 @@ import org.apache.spark.sql.connector.read.PartitionReader
+ import org.apache.spark.sql.execution.datasources.v2.merge.MergePartitionedFile
+ import org.apache.spark.sql.execution.datasources.v2.merge.parquet.batch.merge_operator.{FieldIndex, MergeColumnIndex, MergeColumnarBatchNew, MergeOperator}
+ import org.apache.spark.sql.vectorized.{ColumnVector, ColumnarBatch}
++import org.apache.spark.unsafe.types.UTF8String
+ 
+ import scala.collection.JavaConverters._
+ import scala.collection.mutable.ArrayBuffer
+@@ -28,6 +29,8 @@ import scala.collection.{BufferedIterator, mutable}
+ 
+ object MergeUtils {
+ 
++  val NullString = UTF8String.fromString("null")
++
+   /**
+     * to Buffer Iterator
+     *
+diff --git a/lakesoul-spark/src/main/scala/org/apache/spark/sql/execution/datasources/v2/merge/parquet/batch/merge_operator/FastMerge.scala b/lakesoul-spark/src/main/scala/org/apache/spark/sql/execution/datasources/v2/merge/parquet/batch/merge_operator/FastMerge.scala
+new file mode 100644
+index 0000000..f7d2e8f
+--- /dev/null
++++ b/lakesoul-spark/src/main/scala/org/apache/spark/sql/execution/datasources/v2/merge/parquet/batch/merge_operator/FastMerge.scala
+@@ -0,0 +1,143 @@
++/*
++ * Copyright [2022] [DMetaSoul Team]
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.spark.sql.execution.datasources.v2.merge.parquet.batch.merge_operator
++
++import org.apache.spark.sql.catalyst.InternalRow
++import org.apache.spark.sql.connector.read.PartitionReader
++import org.apache.spark.sql.execution.datasources.v2.merge.parquet.batch.merge_operator.FastMergeOp.MergeOpType
++import org.apache.spark.sql.execution.datasources.v2.merge.parquet.batch.{FastMergeOptimizeHeap, MergeLogic, MergeUtils}
++import org.apache.spark.sql.execution.datasources.v2.merge.{FieldInfo, KeyIndex, MergePartitionedFile}
++import org.apache.spark.sql.vectorized.ColumnarBatch
++import org.apache.spark.unsafe.types.UTF8String
++
++import scala.language.postfixOps
++
++/**
++ * @param filesInfo (file, columnar reader of file)
++ */
++class FastMerge(filesInfo: Seq[(MergePartitionedFile, PartitionReader[ColumnarBatch])],
++                resultSchema: Seq[FieldInfo],
++                mergeOp: Seq[MergeOpType]) extends MergeLogic {
++
++  //Initialize the last piece of data when the batch is switched
++  private val temporaryRow: Array[Any] = new Array[Any](resultSchema.size)
++
++  //get next batch
++  val fileSeq: Seq[(MergePartitionedFile, ColumnarBatch)] = MergeUtils.getNextBatch(filesInfo)
++  val mergeHeap = new FastMergeOptimizeHeap()
++  mergeHeap.enqueueBySeq(MergeUtils.toBufferedIterator(fileSeq))
++
++  def getTemporaryRow(): Array[Any] = {
++    temporaryRow
++  }
++
++  private def deepCopy(): Unit = {
++    temporaryRow.indices.foreach { i =>
++      val v = temporaryRow(i)
++      temporaryRow(i) = v match {
++        case string: UTF8String =>
++          string.clone()
++        case _ =>
++          v
++      }
++    }
++  }
++
++  private def shadowedCopy(row: InternalRow): Unit = {
++    resultSchema.indices.foreach { i =>
++      temporaryRow(i) = row.get(i, resultSchema(i).fieldType)
++    }
++  }
++
++  def isHeapEmpty: Boolean = mergeHeap.isEmpty
++
++  def merge(): Unit = {
++    var lastKey: UTF8String = null
++    var rowVersion: Long = -5
++    while (mergeHeap.nonEmpty) {
++      val currentFile = mergeHeap.dequeue()
++      val currentRowAndLineId = currentFile._2.head
++      val currentVersion = currentFile._1
++      val row = currentRowAndLineId._1
++      val currentKey = row.getUTF8String(0)
++
++      if (lastKey == null) {
++        lastKey = currentKey
++        shadowedCopy(row)
++        rowVersion = currentVersion
++      } else {
++        if (!lastKey.equals(currentKey)) {
++//          mergeHeap.enqueue(currentFile)
++          return
++        } else {
++          // do merge
++          mergeOp.indices.foreach { i =>
++            mergeOp(i) match {
++              case FastMergeOp.Default => // no-op
++              case FastMergeOp.Add =>
++                temporaryRow(i) = temporaryRow(i).asInstanceOf[Long] + row.getLong(i)
++              case FastMergeOp.NonNull if !row.isNullAt(i) &&
++                  (temporaryRow(i) == null || MergeUtils.NullString.equals(temporaryRow(i))) =>
++                temporaryRow(i) = row.getUTF8String(i).clone()
++              case _ =>
++            }
++          }
++        }
++      }
++      currentFile._2.next()
++      if (currentFile._2.hasNext) {
++        mergeHeap.enqueue(currentFile)
++      } else {
++        // go to next batch, need deep copy
++        if (currentVersion == rowVersion) {
++          deepCopy()
++          rowVersion = -5
++          lastKey = temporaryRow(0).asInstanceOf[UTF8String]
++        }
++        val fileInfo = filesInfo.filter(t => t._1.writeVersion.equals(currentVersion))
++        val nextBatches = MergeUtils.getNextBatch(fileInfo)
++        if (nextBatches.nonEmpty) {
++          val bufferIt = MergeUtils.toBufferedIterator(nextBatches)
++          mergeHeap.enqueue(bufferIt.head)
++        } else {
++          mergeHeap.poll()
++        }
++      }
++    }
++  }
++
++  override def closeReadFileReader(): Unit = {
++    filesInfo.foreach(f => f._2.close())
++  }
++
++  private def debugRow(ver: Long, row: InternalRow): Unit = {
++    val p: String = resultSchema.indices.map { i =>
++      if (row.isNullAt(i)) {
++        "null"
++      } else {
++        row.get(i, resultSchema(i).fieldType).toString
++      }
++    }.reduce(_ + "," + _)
++    println("row => " + ver + "," + p)
++  }
++}
++
++object FastMergeOp extends Enumeration {
++  type MergeOpType = Value
++
++  val Default, NonNull, Add = Value
++}
+diff --git a/lakesoul-spark/src/main/scala/org/apache/spark/sql/execution/datasources/v2/merge/parquet/batch/merge_operator/FastMergeReader.scala b/lakesoul-spark/src/main/scala/org/apache/spark/sql/execution/datasources/v2/merge/parquet/batch/merge_operator/FastMergeReader.scala
+new file mode 100644
+index 0000000..a1207e6
+--- /dev/null
++++ b/lakesoul-spark/src/main/scala/org/apache/spark/sql/execution/datasources/v2/merge/parquet/batch/merge_operator/FastMergeReader.scala
+@@ -0,0 +1,78 @@
++package org.apache.spark.sql.execution.datasources.v2.merge.parquet.batch.merge_operator
++
++import org.apache.spark.internal.Logging
++import org.apache.spark.sql.catalyst.InternalRow
++import org.apache.spark.sql.catalyst.expressions.GenericInternalRow
++import org.apache.spark.sql.connector.read.PartitionReader
++import org.apache.spark.sql.execution.datasources.v2.merge.{FieldInfo, MergePartitionedFile}
++import org.apache.spark.sql.vectorized.ColumnarBatch
++
++
++class FastMergeReader[T](filesInfo: Seq[Seq[(MergePartitionedFile, PartitionReader[ColumnarBatch])]],
++                         mergeOperatorInfo: Map[String, MergeOperator[Any]])
++    extends PartitionReader[InternalRow] with Logging {
++
++  private val filesItr: Iterator[Seq[(MergePartitionedFile, PartitionReader[ColumnarBatch])]] = filesInfo.iterator
++  private var mergeLogic: FastMerge = _
++  private val resultSchema: Seq[FieldInfo] = filesInfo.head.head._1.resultSchema
++  private val mergeOp = resultSchema.map { s =>
++    val fieldName = s.fieldName
++    mergeOperatorInfo.get(fieldName) match {
++      case Some(op) =>
++        if (op.isInstanceOf[MergeOpLong]) {
++          FastMergeOp.Add
++        } else if (op.isInstanceOf[MergeNonNullOp[String]]) {
++          FastMergeOp.NonNull
++        } else {
++          throw new UnsupportedOperationException()
++        }
++      case _ => FastMergeOp.Default
++    }
++  }
++
++  /**
++   * @return Boolean
++   */
++  override def next(): Boolean = {
++    if (mergeLogic == null) {
++      if (filesItr.hasNext) {
++        val nextFiles = filesItr.next()
++        if (nextFiles.isEmpty) {
++          return false
++        } else {
++          mergeLogic = new FastMerge(nextFiles, resultSchema, mergeOp)
++        }
++      } else {
++        return false
++      }
++    }
++
++    if (mergeLogic.isHeapEmpty) {
++      if (filesItr.hasNext) {
++        //close current file readers
++        mergeLogic.closeReadFileReader()
++        mergeLogic = new FastMerge(filesItr.next(), resultSchema, mergeOp)
++      } else {
++        return false
++      }
++    }
++
++    mergeLogic.merge()
++    true
++  }
++
++  /**
++   * @return InternalRow
++   */
++  override def get(): InternalRow = {
++    val temporaryRow = mergeLogic.getTemporaryRow()
++    val arrayRow = new GenericInternalRow(temporaryRow)
++    arrayRow
++  }
++
++  override def close(): Unit = {
++    if (filesInfo.nonEmpty) {
++      filesInfo.foreach(f => f.foreach(_._2.close()))
++    }
++  }
++}
+diff --git a/lakesoul-spark/src/main/scala/org/apache/spark/sql/execution/exchange/EnsureRequirements.scala b/lakesoul-spark/src/main/scala/org/apache/spark/sql/execution/exchange/EnsureRequirements.scala
+new file mode 100644
+index 0000000..bb885d1
+--- /dev/null
++++ b/lakesoul-spark/src/main/scala/org/apache/spark/sql/execution/exchange/EnsureRequirements.scala
+@@ -0,0 +1,278 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.spark.sql.execution.exchange
++
++import scala.collection.mutable
++import scala.collection.mutable.ArrayBuffer
++import org.apache.spark.sql.catalyst.expressions._
++import org.apache.spark.sql.catalyst.plans.FullOuter
++import org.apache.spark.sql.catalyst.plans.physical._
++import org.apache.spark.sql.catalyst.rules.Rule
++import org.apache.spark.sql.execution._
++import org.apache.spark.sql.execution.joins.{ShuffledHashJoinExec, SortMergeJoinExec}
++
++/**
++ * Ensures that the [[org.apache.spark.sql.catalyst.plans.physical.Partitioning Partitioning]]
++ * of input data meets the
++ * [[org.apache.spark.sql.catalyst.plans.physical.Distribution Distribution]] requirements for
++ * each operator by inserting [[ShuffleExchangeExec]] Operators where required.  Also ensure that
++ * the input partition ordering requirements are met.
++ */
++object EnsureRequirements extends Rule[SparkPlan] {
++
++  private def ensureDistributionAndOrdering(operator: SparkPlan): SparkPlan = {
++    val requiredChildDistributions: Seq[Distribution] = operator.requiredChildDistribution
++    val requiredChildOrderings: Seq[Seq[SortOrder]] = operator.requiredChildOrdering
++    var children: Seq[SparkPlan] = operator.children
++    assert(requiredChildDistributions.length == children.length)
++    assert(requiredChildOrderings.length == children.length)
++
++    // Ensure that the operator's children satisfy their output distribution requirements.
++    children = children.zip(requiredChildDistributions).map {
++      case (child, distribution) if child.outputPartitioning.satisfies(distribution) =>
++        child
++      case (child, BroadcastDistribution(mode)) =>
++        BroadcastExchangeExec(mode, child)
++      case (child, distribution) =>
++        val numPartitions = distribution.requiredNumPartitions
++          .getOrElse(conf.numShufflePartitions)
++        ShuffleExchangeExec(distribution.createPartitioning(numPartitions), child)
++    }
++
++    // Get the indexes of children which have specified distribution requirements and need to have
++    // same number of partitions.
++    val childrenIndexes = requiredChildDistributions.zipWithIndex.filter {
++      case (UnspecifiedDistribution, _) => false
++      case (_: BroadcastDistribution, _) => false
++      case _ => true
++    }.map(_._2)
++
++    val childrenNumPartitions =
++      childrenIndexes.map(children(_).outputPartitioning.numPartitions).toSet
++
++    if (childrenNumPartitions.size > 1) {
++      // Get the number of partitions which is explicitly required by the distributions.
++      val requiredNumPartitions = {
++        val numPartitionsSet = childrenIndexes.flatMap {
++          index => requiredChildDistributions(index).requiredNumPartitions
++        }.toSet
++        assert(numPartitionsSet.size <= 1,
++          s"$operator have incompatible requirements of the number of partitions for its children")
++        numPartitionsSet.headOption
++      }
++
++      // If there are non-shuffle children that satisfy the required distribution, we have
++      // some tradeoffs when picking the expected number of shuffle partitions:
++      // 1. We should avoid shuffling these children.
++      // 2. We should have a reasonable parallelism.
++      val nonShuffleChildrenNumPartitions =
++      childrenIndexes.map(children).filterNot(_.isInstanceOf[ShuffleExchangeExec])
++        .map(_.outputPartitioning.numPartitions)
++      val expectedChildrenNumPartitions = if (nonShuffleChildrenNumPartitions.nonEmpty) {
++        if (nonShuffleChildrenNumPartitions.length == childrenIndexes.length) {
++          // Here we pick the max number of partitions among these non-shuffle children.
++          nonShuffleChildrenNumPartitions.max
++        } else {
++          // Here we pick the max number of partitions among these non-shuffle children as the
++          // expected number of shuffle partitions. However, if it's smaller than
++          // `conf.numShufflePartitions`, we pick `conf.numShufflePartitions` as the
++          // expected number of shuffle partitions.
++          math.max(nonShuffleChildrenNumPartitions.max, conf.defaultNumShufflePartitions)
++        }
++      } else {
++        childrenNumPartitions.max
++      }
++
++      val targetNumPartitions = requiredNumPartitions.getOrElse(expectedChildrenNumPartitions)
++
++      children = children.zip(requiredChildDistributions).zipWithIndex.map {
++        case ((child, distribution), index) if childrenIndexes.contains(index) =>
++          if (child.outputPartitioning.numPartitions == targetNumPartitions) {
++            child
++          } else {
++            val defaultPartitioning = distribution.createPartitioning(targetNumPartitions)
++            child match {
++              // If child is an exchange, we replace it with a new one having defaultPartitioning.
++              case ShuffleExchangeExec(_, c, _) => ShuffleExchangeExec(defaultPartitioning, c)
++              case _ => ShuffleExchangeExec(defaultPartitioning, child)
++            }
++          }
++
++        case ((child, _), _) => child
++      }
++    }
++
++    // Now that we've performed any necessary shuffles, add sorts to guarantee output orderings:
++    children = children.zip(requiredChildOrderings).map { case (child, requiredOrdering) =>
++      // If child.outputOrdering already satisfies the requiredOrdering, we do not need to sort.
++      if (SortOrder.orderingSatisfies(child.outputOrdering, requiredOrdering)) {
++        child
++      } else {
++        SortExec(requiredOrdering, global = false, child = child)
++      }
++    }
++
++    operator.withNewChildren(children)
++  }
++
++  private def reorder(
++                       leftKeys: IndexedSeq[Expression],
++                       rightKeys: IndexedSeq[Expression],
++                       expectedOrderOfKeys: Seq[Expression],
++                       currentOrderOfKeys: Seq[Expression]): Option[(Seq[Expression], Seq[Expression])] = {
++    if (expectedOrderOfKeys.size != currentOrderOfKeys.size) {
++      return None
++    }
++
++    // Check if the current order already satisfies the expected order.
++    if (expectedOrderOfKeys.zip(currentOrderOfKeys).forall(p => p._1.semanticEquals(p._2))) {
++      return Some(leftKeys, rightKeys)
++    }
++
++    // Build a lookup between an expression and the positions its holds in the current key seq.
++    val keyToIndexMap = mutable.Map.empty[Expression, mutable.BitSet]
++    currentOrderOfKeys.zipWithIndex.foreach {
++      case (key, index) =>
++        keyToIndexMap.getOrElseUpdate(key.canonicalized, mutable.BitSet.empty).add(index)
++    }
++
++    // Reorder the keys.
++    val leftKeysBuffer = new ArrayBuffer[Expression](leftKeys.size)
++    val rightKeysBuffer = new ArrayBuffer[Expression](rightKeys.size)
++    val iterator = expectedOrderOfKeys.iterator
++    while (iterator.hasNext) {
++      // Lookup the current index of this key.
++      keyToIndexMap.get(iterator.next().canonicalized) match {
++        case Some(indices) if indices.nonEmpty =>
++          // Take the first available index from the map.
++          val index = indices.firstKey
++          indices.remove(index)
++
++          // Add the keys for that index to the reordered keys.
++          leftKeysBuffer += leftKeys(index)
++          rightKeysBuffer += rightKeys(index)
++        case _ =>
++          // The expression cannot be found, or we have exhausted all indices for that expression.
++          return None
++      }
++    }
++    Some(leftKeysBuffer.toSeq, rightKeysBuffer.toSeq)
++  }
++
++  private def reorderJoinKeys(
++                               leftKeys: Seq[Expression],
++                               rightKeys: Seq[Expression],
++                               leftPartitioning: Partitioning,
++                               rightPartitioning: Partitioning): (Seq[Expression], Seq[Expression]) = {
++    if (leftKeys.forall(_.deterministic) && rightKeys.forall(_.deterministic)) {
++      reorderJoinKeysRecursively(
++        leftKeys,
++        rightKeys,
++        Some(leftPartitioning),
++        Some(rightPartitioning))
++        .getOrElse((leftKeys, rightKeys))
++    } else {
++      (leftKeys, rightKeys)
++    }
++  }
++
++  /**
++   * Recursively reorders the join keys based on partitioning. It starts reordering the
++   * join keys to match HashPartitioning on either side, followed by PartitioningCollection.
++   */
++  private def reorderJoinKeysRecursively(
++                                          leftKeys: Seq[Expression],
++                                          rightKeys: Seq[Expression],
++                                          leftPartitioning: Option[Partitioning],
++                                          rightPartitioning: Option[Partitioning]): Option[(Seq[Expression], Seq[Expression])] = {
++    (leftPartitioning, rightPartitioning) match {
++      case (Some(HashPartitioning(leftExpressions, _)), _) =>
++        reorder(leftKeys.toIndexedSeq, rightKeys.toIndexedSeq, leftExpressions, leftKeys)
++          .orElse(reorderJoinKeysRecursively(
++            leftKeys, rightKeys, None, rightPartitioning))
++      case (_, Some(HashPartitioning(rightExpressions, _))) =>
++        reorder(leftKeys.toIndexedSeq, rightKeys.toIndexedSeq, rightExpressions, rightKeys)
++          .orElse(reorderJoinKeysRecursively(
++            leftKeys, rightKeys, leftPartitioning, None))
++      case (Some(PartitioningCollection(partitionings)), _) =>
++        partitionings.foldLeft(Option.empty[(Seq[Expression], Seq[Expression])]) { (res, p) =>
++          res.orElse(reorderJoinKeysRecursively(leftKeys, rightKeys, Some(p), rightPartitioning))
++        }.orElse(reorderJoinKeysRecursively(leftKeys, rightKeys, None, rightPartitioning))
++      case (_, Some(PartitioningCollection(partitionings))) =>
++        partitionings.foldLeft(Option.empty[(Seq[Expression], Seq[Expression])]) { (res, p) =>
++          res.orElse(reorderJoinKeysRecursively(leftKeys, rightKeys, leftPartitioning, Some(p)))
++        }.orElse(None)
++      case _ =>
++        None
++    }
++  }
++
++  /**
++   * When the physical operators are created for JOIN, the ordering of join keys is based on order
++   * in which the join keys appear in the user query. That might not match with the output
++   * partitioning of the join node's children (thus leading to extra sort / shuffle being
++   * introduced). This rule will change the ordering of the join keys to match with the
++   * partitioning of the join nodes' children.
++   */
++  private def reorderJoinPredicates(plan: SparkPlan): SparkPlan = {
++    plan match {
++      case ShuffledHashJoinExec(leftKeys, rightKeys, joinType, buildSide, condition, left, right) =>
++        val (reorderedLeftKeys, reorderedRightKeys) =
++          reorderJoinKeys(leftKeys, rightKeys, left.outputPartitioning, right.outputPartitioning)
++        ShuffledHashJoinExec(reorderedLeftKeys, reorderedRightKeys, joinType, buildSide, condition,
++          left, right)
++
++      case SortMergeJoinExec(leftKeys, rightKeys, joinType, condition, left, right, isPartial) =>
++        val (reorderedLeftKeys, reorderedRightKeys) =
++          reorderJoinKeys(leftKeys, rightKeys, left.outputPartitioning, right.outputPartitioning)
++        SortMergeJoinExec(reorderedLeftKeys, reorderedRightKeys, joinType, condition,
++          left, right, isPartial)
++
++      case other => other
++    }
++  }
++
++  def apply(plan: SparkPlan): SparkPlan = {
++    val exchangedPlan = plan.transformUp {
++      // TODO: remove this after we create a physical operator for `RepartitionByExpression`.
++      case operator@ShuffleExchangeExec(upper: HashPartitioning, child, _) =>
++        child.outputPartitioning match {
++          case lower: HashPartitioning if upper.semanticEquals(lower) => child
++          case _ => operator
++        }
++      case operator: SparkPlan =>
++        ensureDistributionAndOrdering(reorderJoinPredicates(operator))
++    }
++    exchangedPlan.transformUp {
++      case smj @ SortMergeJoinExec(_, _, FullOuter, _, left, right, _) =>
++        var newLeft = left
++        var newRight = right
++        left match {
++          case SortExec(_, _, ShuffleExchangeExec(_, p: ProjectExec, _), _) =>
++            newLeft = p
++          case _ =>
++        }
++        right match {
++          case SortExec(_, _, ShuffleExchangeExec(_, p: ProjectExec, _), _) =>
++            newRight = p
++          case _ =>
++        }
++        smj.withNewChildren(Seq(newLeft, newRight))
++    }
++  }
++}
+diff --git a/lakesoul-spark/src/main/scala/org/apache/spark/sql/execution/joins/SortMergeJoinExec.scala b/lakesoul-spark/src/main/scala/org/apache/spark/sql/execution/joins/SortMergeJoinExec.scala
+new file mode 100644
+index 0000000..8f4fe53
+--- /dev/null
++++ b/lakesoul-spark/src/main/scala/org/apache/spark/sql/execution/joins/SortMergeJoinExec.scala
+@@ -0,0 +1,1455 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.spark.sql.execution.joins
++
++import scala.collection.mutable.ArrayBuffer
++
++import org.apache.spark.rdd.RDD
++import org.apache.spark.sql.catalyst.InternalRow
++import org.apache.spark.sql.catalyst.expressions._
++import org.apache.spark.sql.catalyst.expressions.BindReferences.bindReferences
++import org.apache.spark.sql.catalyst.expressions.codegen._
++import org.apache.spark.sql.catalyst.expressions.codegen.Block._
++import org.apache.spark.sql.catalyst.plans._
++import org.apache.spark.sql.catalyst.plans.physical._
++import org.apache.spark.sql.execution._
++import org.apache.spark.sql.execution.metric.{SQLMetric, SQLMetrics}
++import org.apache.spark.util.collection.BitSet
++
++/**
++ * Performs a sort merge join of two child relations.
++ */
++case class SortMergeJoinExec(
++                              leftKeys: Seq[Expression],
++                              rightKeys: Seq[Expression],
++                              joinType: JoinType,
++                              condition: Option[Expression],
++                              left: SparkPlan,
++                              right: SparkPlan,
++                              isSkewJoin: Boolean = false) extends ShuffledJoin with CodegenSupport {
++
++  override lazy val metrics = Map(
++    "numOutputRows" -> SQLMetrics.createMetric(sparkContext, "number of output rows"))
++
++  override def nodeName: String = {
++    if (isSkewJoin) super.nodeName + "(skew=true)" else super.nodeName
++  }
++
++  override def stringArgs: Iterator[Any] = super.stringArgs.toSeq.dropRight(1).iterator
++
++  override def requiredChildDistribution: Seq[Distribution] = {
++    if (isSkewJoin) {
++      // We re-arrange the shuffle partitions to deal with skew join, and the new children
++      // partitioning doesn't satisfy `HashClusteredDistribution`.
++      UnspecifiedDistribution :: UnspecifiedDistribution :: Nil
++    } else {
++      super.requiredChildDistribution
++    }
++  }
++
++  override def outputOrdering: Seq[SortOrder] = joinType match {
++    // For inner join, orders of both sides keys should be kept.
++    case _: InnerLike =>
++      val leftKeyOrdering = getKeyOrdering(leftKeys, left.outputOrdering)
++      val rightKeyOrdering = getKeyOrdering(rightKeys, right.outputOrdering)
++      leftKeyOrdering.zip(rightKeyOrdering).map { case (lKey, rKey) =>
++        // Also add expressions from right side sort order
++        val sameOrderExpressions = ExpressionSet(lKey.sameOrderExpressions ++ rKey.children)
++        SortOrder(lKey.child, Ascending, sameOrderExpressions.toSeq)
++      }
++    // For left and right outer joins, the output is ordered by the streamed input's join keys.
++    case LeftOuter => getKeyOrdering(leftKeys, left.outputOrdering)
++    case RightOuter => getKeyOrdering(rightKeys, right.outputOrdering)
++    // There are null rows in both streams, so there is no order.
++    case FullOuter => Nil
++    case LeftExistence(_) => getKeyOrdering(leftKeys, left.outputOrdering)
++    case x =>
++      throw new IllegalArgumentException(
++        s"${getClass.getSimpleName} should not take $x as the JoinType")
++  }
++
++  /**
++   * The utility method to get output ordering for left or right side of the join.
++   *
++   * Returns the required ordering for left or right child if childOutputOrdering does not
++   * satisfy the required ordering; otherwise, which means the child does not need to be sorted
++   * again, returns the required ordering for this child with extra "sameOrderExpressions" from
++   * the child's outputOrdering.
++   */
++  private def getKeyOrdering(keys: Seq[Expression], childOutputOrdering: Seq[SortOrder])
++  : Seq[SortOrder] = {
++    val requiredOrdering = requiredOrders(keys)
++    if (SortOrder.orderingSatisfies(childOutputOrdering, requiredOrdering)) {
++      keys.zip(childOutputOrdering).map { case (key, childOrder) =>
++        val sameOrderExpressionsSet = ExpressionSet(childOrder.children) - key
++        SortOrder(key, Ascending, sameOrderExpressionsSet.toSeq)
++      }
++    } else {
++      requiredOrdering
++    }
++  }
++
++  override def requiredChildOrdering: Seq[Seq[SortOrder]] =
++    requiredOrders(leftKeys) :: requiredOrders(rightKeys) :: Nil
++
++  private def requiredOrders(keys: Seq[Expression]): Seq[SortOrder] = {
++    // This must be ascending in order to agree with the `keyOrdering` defined in `doExecute()`.
++    keys.map(SortOrder(_, Ascending))
++  }
++
++  private def createLeftKeyGenerator(): Projection =
++    UnsafeProjection.create(leftKeys, left.output)
++
++  private def createRightKeyGenerator(): Projection =
++    UnsafeProjection.create(rightKeys, right.output)
++
++  private def getSpillThreshold: Int = {
++    sqlContext.conf.sortMergeJoinExecBufferSpillThreshold
++  }
++
++  private def getInMemoryThreshold: Int = {
++    sqlContext.conf.sortMergeJoinExecBufferInMemoryThreshold
++  }
++
++  protected override def doExecute(): RDD[InternalRow] = {
++    val numOutputRows = longMetric("numOutputRows")
++    val spillThreshold = getSpillThreshold
++    val inMemoryThreshold = getInMemoryThreshold
++    left.execute().zipPartitions(right.execute()) { (leftIter, rightIter) =>
++      val boundCondition: (InternalRow) => Boolean = {
++        condition.map { cond =>
++          Predicate.create(cond, left.output ++ right.output).eval _
++        }.getOrElse {
++          (r: InternalRow) => true
++        }
++      }
++
++      // An ordering that can be used to compare keys from both sides.
++      val keyOrdering = RowOrdering.createNaturalAscendingOrdering(leftKeys.map(_.dataType))
++      val resultProj: InternalRow => InternalRow = UnsafeProjection.create(output, output)
++
++      joinType match {
++        case _: InnerLike =>
++          new RowIterator {
++            private[this] var currentLeftRow: InternalRow = _
++            private[this] var currentRightMatches: ExternalAppendOnlyUnsafeRowArray = _
++            private[this] var rightMatchesIterator: Iterator[UnsafeRow] = null
++            private[this] val smjScanner = new SortMergeJoinScanner(
++              createLeftKeyGenerator(),
++              createRightKeyGenerator(),
++              keyOrdering,
++              RowIterator.fromScala(leftIter),
++              RowIterator.fromScala(rightIter),
++              inMemoryThreshold,
++              spillThreshold,
++              cleanupResources
++            )
++            private[this] val joinRow = new JoinedRow
++
++            if (smjScanner.findNextInnerJoinRows()) {
++              currentRightMatches = smjScanner.getBufferedMatches
++              currentLeftRow = smjScanner.getStreamedRow
++              rightMatchesIterator = currentRightMatches.generateIterator()
++            }
++
++            override def advanceNext(): Boolean = {
++              while (rightMatchesIterator != null) {
++                if (!rightMatchesIterator.hasNext) {
++                  if (smjScanner.findNextInnerJoinRows()) {
++                    currentRightMatches = smjScanner.getBufferedMatches
++                    currentLeftRow = smjScanner.getStreamedRow
++                    rightMatchesIterator = currentRightMatches.generateIterator()
++                  } else {
++                    currentRightMatches = null
++                    currentLeftRow = null
++                    rightMatchesIterator = null
++                    return false
++                  }
++                }
++                joinRow(currentLeftRow, rightMatchesIterator.next())
++                if (boundCondition(joinRow)) {
++                  numOutputRows += 1
++                  return true
++                }
++              }
++              false
++            }
++
++            override def getRow: InternalRow = resultProj(joinRow)
++          }.toScala
++
++        case LeftOuter =>
++          val smjScanner = new SortMergeJoinScanner(
++            streamedKeyGenerator = createLeftKeyGenerator(),
++            bufferedKeyGenerator = createRightKeyGenerator(),
++            keyOrdering,
++            streamedIter = RowIterator.fromScala(leftIter),
++            bufferedIter = RowIterator.fromScala(rightIter),
++            inMemoryThreshold,
++            spillThreshold,
++            cleanupResources
++          )
++          val rightNullRow = new GenericInternalRow(right.output.length)
++          new LeftOuterIterator(
++            smjScanner, rightNullRow, boundCondition, resultProj, numOutputRows).toScala
++
++        case RightOuter =>
++          val smjScanner = new SortMergeJoinScanner(
++            streamedKeyGenerator = createRightKeyGenerator(),
++            bufferedKeyGenerator = createLeftKeyGenerator(),
++            keyOrdering,
++            streamedIter = RowIterator.fromScala(rightIter),
++            bufferedIter = RowIterator.fromScala(leftIter),
++            inMemoryThreshold,
++            spillThreshold,
++            cleanupResources
++          )
++          val leftNullRow = new GenericInternalRow(left.output.length)
++          new RightOuterIterator(
++            smjScanner, leftNullRow, boundCondition, resultProj, numOutputRows).toScala
++
++        case FullOuter =>
++          val leftNullRow = new GenericInternalRow(left.output.length)
++          val rightNullRow = new GenericInternalRow(right.output.length)
++          val smjScanner = new SortMergeFullOuterJoinScanner(
++            leftKeyGenerator = createLeftKeyGenerator(),
++            rightKeyGenerator = createRightKeyGenerator(),
++            keyOrdering,
++            leftIter = RowIterator.fromScala(leftIter),
++            rightIter = RowIterator.fromScala(rightIter),
++            boundCondition,
++            leftNullRow,
++            rightNullRow)
++
++          new FullOuterIterator(
++            smjScanner,
++            resultProj,
++            numOutputRows).toScala
++
++        case LeftSemi =>
++          new RowIterator {
++            private[this] var currentLeftRow: InternalRow = _
++            private[this] val smjScanner = new SortMergeJoinScanner(
++              createLeftKeyGenerator(),
++              createRightKeyGenerator(),
++              keyOrdering,
++              RowIterator.fromScala(leftIter),
++              RowIterator.fromScala(rightIter),
++              inMemoryThreshold,
++              spillThreshold,
++              cleanupResources,
++              condition.isEmpty
++            )
++            private[this] val joinRow = new JoinedRow
++
++            override def advanceNext(): Boolean = {
++              while (smjScanner.findNextInnerJoinRows()) {
++                val currentRightMatches = smjScanner.getBufferedMatches
++                currentLeftRow = smjScanner.getStreamedRow
++                if (currentRightMatches != null && currentRightMatches.length > 0) {
++                  val rightMatchesIterator = currentRightMatches.generateIterator()
++                  while (rightMatchesIterator.hasNext) {
++                    joinRow(currentLeftRow, rightMatchesIterator.next())
++                    if (boundCondition(joinRow)) {
++                      numOutputRows += 1
++                      return true
++                    }
++                  }
++                }
++              }
++              false
++            }
++
++            override def getRow: InternalRow = currentLeftRow
++          }.toScala
++
++        case LeftAnti =>
++          new RowIterator {
++            private[this] var currentLeftRow: InternalRow = _
++            private[this] val smjScanner = new SortMergeJoinScanner(
++              createLeftKeyGenerator(),
++              createRightKeyGenerator(),
++              keyOrdering,
++              RowIterator.fromScala(leftIter),
++              RowIterator.fromScala(rightIter),
++              inMemoryThreshold,
++              spillThreshold,
++              cleanupResources,
++              condition.isEmpty
++            )
++            private[this] val joinRow = new JoinedRow
++
++            override def advanceNext(): Boolean = {
++              while (smjScanner.findNextOuterJoinRows()) {
++                currentLeftRow = smjScanner.getStreamedRow
++                val currentRightMatches = smjScanner.getBufferedMatches
++                if (currentRightMatches == null || currentRightMatches.length == 0) {
++                  numOutputRows += 1
++                  return true
++                }
++                var found = false
++                val rightMatchesIterator = currentRightMatches.generateIterator()
++                while (!found && rightMatchesIterator.hasNext) {
++                  joinRow(currentLeftRow, rightMatchesIterator.next())
++                  if (boundCondition(joinRow)) {
++                    found = true
++                  }
++                }
++                if (!found) {
++                  numOutputRows += 1
++                  return true
++                }
++              }
++              false
++            }
++
++            override def getRow: InternalRow = currentLeftRow
++          }.toScala
++
++        case j: ExistenceJoin =>
++          new RowIterator {
++            private[this] var currentLeftRow: InternalRow = _
++            private[this] val result: InternalRow = new GenericInternalRow(Array[Any](null))
++            private[this] val smjScanner = new SortMergeJoinScanner(
++              createLeftKeyGenerator(),
++              createRightKeyGenerator(),
++              keyOrdering,
++              RowIterator.fromScala(leftIter),
++              RowIterator.fromScala(rightIter),
++              inMemoryThreshold,
++              spillThreshold,
++              cleanupResources,
++              condition.isEmpty
++            )
++            private[this] val joinRow = new JoinedRow
++
++            override def advanceNext(): Boolean = {
++              while (smjScanner.findNextOuterJoinRows()) {
++                currentLeftRow = smjScanner.getStreamedRow
++                val currentRightMatches = smjScanner.getBufferedMatches
++                var found = false
++                if (currentRightMatches != null && currentRightMatches.length > 0) {
++                  val rightMatchesIterator = currentRightMatches.generateIterator()
++                  while (!found && rightMatchesIterator.hasNext) {
++                    joinRow(currentLeftRow, rightMatchesIterator.next())
++                    if (boundCondition(joinRow)) {
++                      found = true
++                    }
++                  }
++                }
++                result.setBoolean(0, found)
++                numOutputRows += 1
++                return true
++              }
++              false
++            }
++
++            override def getRow: InternalRow = resultProj(joinRow(currentLeftRow, result))
++          }.toScala
++
++        case x =>
++          throw new IllegalArgumentException(
++            s"SortMergeJoin should not take $x as the JoinType")
++      }
++
++    }
++  }
++
++  override def supportCodegen: Boolean = {
++    joinType.isInstanceOf[InnerLike] || joinType.toString.equals("FullOuter")
++  }
++
++  override def inputRDDs(): Seq[RDD[InternalRow]] = {
++    left.execute() :: right.execute() :: Nil
++  }
++
++  private def createJoinKey(
++                             ctx: CodegenContext,
++                             row: String,
++                             keys: Seq[Expression],
++                             input: Seq[Attribute]): Seq[ExprCode] = {
++    ctx.INPUT_ROW = row
++    ctx.currentVars = null
++    bindReferences(keys, input).map(_.genCode(ctx))
++  }
++
++  private def copyKeys(ctx: CodegenContext, vars: Seq[ExprCode]): Seq[ExprCode] = {
++    vars.zipWithIndex.map { case (ev, i) =>
++      ctx.addBufferedState(leftKeys(i).dataType, "value", ev.value)
++    }
++  }
++
++  private def genComparison(ctx: CodegenContext, a: Seq[ExprCode], b: Seq[ExprCode]): String = {
++    val comparisons = a.zip(b).zipWithIndex.map { case ((l, r), i) =>
++      s"""
++         |if (comp == 0) {
++         |  comp = ${ctx.genComp(leftKeys(i).dataType, l.value, r.value)};
++         |}
++       """.stripMargin.trim
++    }
++    s"""
++       |comp = 0;
++       |${comparisons.mkString("\n")}
++     """.stripMargin
++  }
++
++  /**
++   * Generate a function to scan both left and right to find a match, returns the term for
++   * matched one row from left side and buffered rows from right side.
++   */
++  private def genScanner(ctx: CodegenContext): (String, String) = {
++    // Create class member for next row from both sides.
++    // Inline mutable state since not many join operations in a task
++    val leftRow = ctx.addMutableState("InternalRow", "leftRow", forceInline = true)
++    val rightRow = ctx.addMutableState("InternalRow", "rightRow", forceInline = true)
++
++    // Create variables for join keys from both sides.
++    val leftKeyVars = createJoinKey(ctx, leftRow, leftKeys, left.output)
++    val leftAnyNull = leftKeyVars.map(_.isNull).mkString(" || ")
++    val rightKeyTmpVars = createJoinKey(ctx, rightRow, rightKeys, right.output)
++    val rightAnyNull = rightKeyTmpVars.map(_.isNull).mkString(" || ")
++    // Copy the right key as class members so they could be used in next function call.
++    val rightKeyVars = copyKeys(ctx, rightKeyTmpVars)
++
++    // A list to hold all matched rows from right side.
++    val clsName = classOf[ExternalAppendOnlyUnsafeRowArray].getName
++
++    val spillThreshold = getSpillThreshold
++    val inMemoryThreshold = getInMemoryThreshold
++
++    // Inline mutable state since not many join operations in a task
++    val matches = ctx.addMutableState(clsName, "matches",
++      v => s"$v = new $clsName($inMemoryThreshold, $spillThreshold);", forceInline = true)
++    // Copy the left keys as class members so they could be used in next function call.
++    val matchedKeyVars = copyKeys(ctx, leftKeyVars)
++
++    ctx.addNewFunction("findNextInnerJoinRows",
++      s"""
++         |private boolean findNextInnerJoinRows(
++         |    scala.collection.Iterator leftIter,
++         |    scala.collection.Iterator rightIter) {
++         |  $leftRow = null;
++         |  int comp = 0;
++         |  while ($leftRow == null) {
++         |    if (!leftIter.hasNext()) return false;
++         |    $leftRow = (InternalRow) leftIter.next();
++         |    ${leftKeyVars.map(_.code).mkString("\n")}
++         |    if ($leftAnyNull) {
++         |      $leftRow = null;
++         |      continue;
++         |    }
++         |    if (!$matches.isEmpty()) {
++         |      ${genComparison(ctx, leftKeyVars, matchedKeyVars)}
++         |      if (comp == 0) {
++         |        return true;
++         |      }
++         |      $matches.clear();
++         |    }
++         |
++         |    do {
++         |      if ($rightRow == null) {
++         |        if (!rightIter.hasNext()) {
++         |          ${matchedKeyVars.map(_.code).mkString("\n")}
++         |          return !$matches.isEmpty();
++         |        }
++         |        $rightRow = (InternalRow) rightIter.next();
++         |        ${rightKeyTmpVars.map(_.code).mkString("\n")}
++         |        if ($rightAnyNull) {
++         |          $rightRow = null;
++         |          continue;
++         |        }
++         |        ${rightKeyVars.map(_.code).mkString("\n")}
++         |      }
++         |      ${genComparison(ctx, leftKeyVars, rightKeyVars)}
++         |      if (comp > 0) {
++         |        $rightRow = null;
++         |      } else if (comp < 0) {
++         |        if (!$matches.isEmpty()) {
++         |          ${matchedKeyVars.map(_.code).mkString("\n")}
++         |          return true;
++         |        }
++         |        $leftRow = null;
++         |      } else {
++         |        $matches.add((UnsafeRow) $rightRow);
++         |        $rightRow = null;
++         |      }
++         |    } while ($leftRow != null);
++         |  }
++         |  return false; // unreachable
++         |}
++       """.stripMargin, inlineToOuterClass = true)
++
++    (leftRow, matches)
++  }
++
++  /**
++   * Creates variables and declarations for left part of result row.
++   *
++   * In order to defer the access after condition and also only access once in the loop,
++   * the variables should be declared separately from accessing the columns, we can't use the
++   * codegen of BoundReference here.
++   */
++  private def createLeftVars(ctx: CodegenContext, leftRow: String): (Seq[ExprCode], Seq[String]) = {
++    ctx.INPUT_ROW = leftRow
++    left.output.zipWithIndex.map { case (a, i) =>
++      val value = ctx.freshName("value")
++      val valueCode = CodeGenerator.getValue(leftRow, a.dataType, i.toString)
++      val javaType = CodeGenerator.javaType(a.dataType)
++      val defaultValue = CodeGenerator.defaultValue(a.dataType)
++      if (a.nullable) {
++        val isNull = ctx.freshName("isNull")
++        val code =
++          code"""
++                |$isNull = $leftRow.isNullAt($i);
++                |$value = $isNull ? $defaultValue : ($valueCode);
++           """.stripMargin
++        val leftVarsDecl =
++          s"""
++             |boolean $isNull = false;
++             |$javaType $value = $defaultValue;
++           """.stripMargin
++        (ExprCode(code, JavaCode.isNullVariable(isNull), JavaCode.variable(value, a.dataType)),
++          leftVarsDecl)
++      } else {
++        val code = code"$value = $valueCode;"
++        val leftVarsDecl = s"""$javaType $value = $defaultValue;"""
++        (ExprCode(code, FalseLiteral, JavaCode.variable(value, a.dataType)), leftVarsDecl)
++      }
++    }.unzip
++  }
++
++  /**
++   * Creates the variables for right part of result row, using BoundReference, since the right
++   * part are accessed inside the loop.
++   */
++  private def createRightVar(ctx: CodegenContext, rightRow: String): Seq[ExprCode] = {
++    ctx.INPUT_ROW = rightRow
++    right.output.zipWithIndex.map { case (a, i) =>
++      BoundReference(i, a.dataType, a.nullable).genCode(ctx)
++    }
++  }
++
++  /**
++   * Splits variables based on whether it's used by condition or not, returns the code to create
++   * these variables before the condition and after the condition.
++   *
++   * Only a few columns are used by condition, then we can skip the accessing of those columns
++   * that are not used by condition also filtered out by condition.
++   */
++  private def splitVarsByCondition(
++                                    attributes: Seq[Attribute],
++                                    variables: Seq[ExprCode]): (String, String) = {
++    if (condition.isDefined) {
++      val condRefs = condition.get.references
++      val (used, notUsed) = attributes.zip(variables).partition{ case (a, ev) =>
++        condRefs.contains(a)
++      }
++      val beforeCond = evaluateVariables(used.map(_._2))
++      val afterCond = evaluateVariables(notUsed.map(_._2))
++      (beforeCond, afterCond)
++    } else {
++      (evaluateVariables(variables), "")
++    }
++  }
++
++  override def needCopyResult: Boolean = true
++
++  override def doProduce(ctx: CodegenContext): String = {
++    if (joinType.toString.equals("FullOuter")) {
++      return codegenFullOuter(ctx)
++    }
++    // Inline mutable state since not many join operations in a task
++    val leftInput = ctx.addMutableState("scala.collection.Iterator", "leftInput",
++      v => s"$v = inputs[0];", forceInline = true)
++    val rightInput = ctx.addMutableState("scala.collection.Iterator", "rightInput",
++      v => s"$v = inputs[1];", forceInline = true)
++
++    val (leftRow, matches) = genScanner(ctx)
++
++    // Create variables for row from both sides.
++    val (leftVars, leftVarDecl) = createLeftVars(ctx, leftRow)
++    val rightRow = ctx.freshName("rightRow")
++    val rightVars = createRightVar(ctx, rightRow)
++
++    val iterator = ctx.freshName("iterator")
++    val numOutput = metricTerm(ctx, "numOutputRows")
++    val (beforeLoop, condCheck) = if (condition.isDefined) {
++      // Split the code of creating variables based on whether it's used by condition or not.
++      val loaded = ctx.freshName("loaded")
++      val (leftBefore, leftAfter) = splitVarsByCondition(left.output, leftVars)
++      val (rightBefore, rightAfter) = splitVarsByCondition(right.output, rightVars)
++      // Generate code for condition
++      ctx.currentVars = leftVars ++ rightVars
++      val cond = BindReferences.bindReference(condition.get, output).genCode(ctx)
++      // evaluate the columns those used by condition before loop
++      val before = s"""
++                      |boolean $loaded = false;
++                      |$leftBefore
++         """.stripMargin
++
++      val checking = s"""
++                        |$rightBefore
++                        |${cond.code}
++                        |if (${cond.isNull} || !${cond.value}) continue;
++                        |if (!$loaded) {
++                        |  $loaded = true;
++                        |  $leftAfter
++                        |}
++                        |$rightAfter
++     """.stripMargin
++      (before, checking)
++    } else {
++      (evaluateVariables(leftVars), "")
++    }
++
++    val thisPlan = ctx.addReferenceObj("plan", this)
++    val eagerCleanup = s"$thisPlan.cleanupResources();"
++
++    s"""
++       |while (findNextInnerJoinRows($leftInput, $rightInput)) {
++       |  ${leftVarDecl.mkString("\n")}
++       |  ${beforeLoop.trim}
++       |  scala.collection.Iterator<UnsafeRow> $iterator = $matches.generateIterator();
++       |  while ($iterator.hasNext()) {
++       |    InternalRow $rightRow = (InternalRow) $iterator.next();
++       |    ${condCheck.trim}
++       |    $numOutput.add(1);
++       |    ${consume(ctx, leftVars ++ rightVars)}
++       |  }
++       |  if (shouldStop()) return;
++       |}
++       |$eagerCleanup
++     """.stripMargin
++  }
++
++  /**
++   * Generates the code for variables of one child side of join.
++   */
++  protected def genOneSideJoinVars(
++                                    ctx: CodegenContext,
++                                    row: String,
++                                    plan: SparkPlan,
++                                    setDefaultValue: Boolean): Seq[ExprCode] = {
++    ctx.currentVars = null
++    ctx.INPUT_ROW = row
++    plan.output.zipWithIndex.map { case (a, i) =>
++      val ev = BoundReference(i, a.dataType, a.nullable).genCode(ctx)
++      if (setDefaultValue) {
++        // the variables are needed even there is no matched rows
++        val isNull = ctx.freshName("isNull")
++        val value = ctx.freshName("value")
++        val javaType = CodeGenerator.javaType(a.dataType)
++        val code = code"""
++                         |boolean $isNull = true;
++                         |$javaType $value = ${CodeGenerator.defaultValue(a.dataType)};
++                         |if ($row != null) {
++                         |  ${ev.code}
++                         |  $isNull = ${ev.isNull};
++                         |  $value = ${ev.value};
++                         |}
++          """.stripMargin
++        ExprCode(code, JavaCode.isNullVariable(isNull), JavaCode.variable(value, a.dataType))
++      } else {
++        ev
++      }
++    }
++  }
++
++  /**
++   * Generate the (non-equi) condition used to filter joined rows.
++   * This is used in Inner, Left Semi, Left Anti and Full Outer joins.
++   *
++   * @return Tuple of variable name for row of build side, generated code for condition,
++   *         and generated code for variables of build side.
++   */
++  protected def getJoinCondition(
++                                  ctx: CodegenContext,
++                                  streamVars: Seq[ExprCode],
++                                  streamPlan: SparkPlan,
++                                  buildPlan: SparkPlan,
++                                  buildRow: Option[String] = None): (String, String, Seq[ExprCode]) = {
++    val buildSideRow = buildRow.getOrElse(ctx.freshName("buildRow"))
++    val buildVars = genOneSideJoinVars(ctx, buildSideRow, buildPlan, setDefaultValue = false)
++    val checkCondition = if (condition.isDefined) {
++      val expr = condition.get
++      // evaluate the variables from build side that used by condition
++      val eval = evaluateRequiredVariables(buildPlan.output, buildVars, expr.references)
++
++      // filter the output via condition
++      ctx.currentVars = streamVars ++ buildVars
++      val ev =
++        BindReferences.bindReference(expr, streamPlan.output ++ buildPlan.output).genCode(ctx)
++      val skipRow = s"${ev.isNull} || !${ev.value}"
++      s"""
++         |$eval
++         |${ev.code}
++         |if (!($skipRow))
++       """.stripMargin
++    } else {
++      ""
++    }
++    (buildSideRow, checkCondition, buildVars)
++  }
++
++  /**
++   * Generates the code for Full Outer join.
++   */
++  private def codegenFullOuter(ctx: CodegenContext): String = {
++    // Inline mutable state since not many join operations in a task.
++    // Create class member for input iterator from both sides.
++    val leftInput = ctx.addMutableState("scala.collection.Iterator", "leftInput",
++      v => s"$v = inputs[0];", forceInline = true)
++    val rightInput = ctx.addMutableState("scala.collection.Iterator", "rightInput",
++      v => s"$v = inputs[1];", forceInline = true)
++
++    // Create class member for next input row from both sides.
++    val leftInputRow = ctx.addMutableState("InternalRow", "leftInputRow", forceInline = true)
++    val rightInputRow = ctx.addMutableState("InternalRow", "rightInputRow", forceInline = true)
++
++    // Create variables for join keys from both sides.
++    val leftKeyVars = createJoinKey(ctx, leftInputRow, leftKeys, left.output)
++    val rightKeyVars = createJoinKey(ctx, rightInputRow, rightKeys, right.output)
++    val matchedKeyVars = copyKeys(ctx, leftKeyVars)
++    val leftMatchedKeyVars = createJoinKey(ctx, leftInputRow, leftKeys, left.output)
++    val rightMatchedKeyVars = createJoinKey(ctx, rightInputRow, rightKeys, right.output)
++
++    // Create class member for next output row from both sides.
++    val leftOutputRow = ctx.addMutableState("InternalRow", "leftOutputRow", forceInline = true)
++    val rightOutputRow = ctx.addMutableState("InternalRow", "rightOutputRow", forceInline = true)
++
++    // Create class member for buffers of rows with same join keys from both sides.
++    val bufferClsName = "java.util.ArrayList<InternalRow>"
++    val leftBuffer = ctx.addMutableState(bufferClsName, "leftBuffer",
++      v => s"$v = new $bufferClsName();", forceInline = true)
++    val rightBuffer = ctx.addMutableState(bufferClsName, "rightBuffer",
++      v => s"$v = new $bufferClsName();", forceInline = true)
++    val matchedClsName = classOf[BitSet].getName
++    val leftMatched = ctx.addMutableState(matchedClsName, "leftMatched",
++      v => s"$v = new $matchedClsName(1);", forceInline = true)
++    val rightMatched = ctx.addMutableState(matchedClsName, "rightMatched",
++      v => s"$v = new $matchedClsName(1);", forceInline = true)
++    val leftIndex = ctx.freshName("leftIndex")
++    val rightIndex = ctx.freshName("rightIndex")
++
++    // Generate code for join condition
++    val leftResultVars = genOneSideJoinVars(
++      ctx, leftOutputRow, left, setDefaultValue = true)
++    val rightResultVars = genOneSideJoinVars(
++      ctx, rightOutputRow, right, setDefaultValue = true)
++    val resultVars = leftResultVars ++ rightResultVars
++    val (_, conditionCheck, _) =
++      getJoinCondition(ctx, leftResultVars, left, right, Some(rightOutputRow))
++
++    // Generate code for result output in separate function, as we need to output result from
++    // multiple places in join code.
++    val consumeFullOuterJoinRow = ctx.freshName("consumeFullOuterJoinRow")
++    ctx.addNewFunction(consumeFullOuterJoinRow,
++      s"""
++         |private void $consumeFullOuterJoinRow() throws java.io.IOException {
++         |  ${metricTerm(ctx, "numOutputRows")}.add(1);
++         |  ${consume(ctx, resultVars)}
++         |}
++       """.stripMargin)
++
++    // Handle the case when input row has no match.
++    val outputLeftNoMatch =
++      s"""
++         |$leftOutputRow = $leftInputRow;
++         |$rightOutputRow = null;
++         |$leftInputRow = null;
++         |$consumeFullOuterJoinRow();
++       """.stripMargin
++    val outputRightNoMatch =
++      s"""
++         |$rightOutputRow = $rightInputRow;
++         |$leftOutputRow = null;
++         |$rightInputRow = null;
++         |$consumeFullOuterJoinRow();
++       """.stripMargin
++
++    // Generate a function to scan both sides to find rows with matched join keys.
++    // The matched rows from both sides are copied in buffers separately. This function assumes
++    // either non-empty `leftIter` and `rightIter`, or non-null `leftInputRow` and `rightInputRow`.
++    //
++    // The function has the following steps:
++    //  - Step 1: Find the next `leftInputRow` and `rightInputRow` with non-null join keys.
++    //            Output row with null join keys (`outputLeftNoMatch` and `outputRightNoMatch`).
++    //
++    //  - Step 2: Compare and find next same join keys from between `leftInputRow` and
++    //            `rightInputRow`.
++    //            Output row with smaller join keys (`outputLeftNoMatch` and `outputRightNoMatch`).
++    //
++    //  - Step 3: Buffer rows with same join keys from both sides into `leftBuffer` and
++    //            `rightBuffer`. Reset bit sets for both buffers accordingly (`leftMatched` and
++    //            `rightMatched`).
++    val findNextJoinRowsFuncName = ctx.freshName("findNextJoinRows")
++    ctx.addNewFunction(findNextJoinRowsFuncName,
++      s"""
++         |private void $findNextJoinRowsFuncName(
++         |    scala.collection.Iterator leftIter,
++         |    scala.collection.Iterator rightIter) throws java.io.IOException {
++         |  int comp = 0;
++         |  $leftBuffer.clear();
++         |  $rightBuffer.clear();
++         |
++         |  if ($leftInputRow == null) {
++         |    $leftInputRow = (InternalRow) leftIter.next();
++         |  }
++         |  if ($rightInputRow == null) {
++         |    $rightInputRow = (InternalRow) rightIter.next();
++         |  }
++         |
++         |  ${leftKeyVars.map(_.code).mkString("\n")}
++         |  ${rightKeyVars.map(_.code).mkString("\n")}
++         |  ${genComparison(ctx, leftKeyVars, rightKeyVars)}
++         |  if (comp < 0) {
++         |    // The left row join key is smaller, join it with null row
++         |    $outputLeftNoMatch
++         |    return;
++         |  } else if (comp > 0) {
++         |    // The right row join key is smaller, join it with null row
++         |    $outputRightNoMatch
++         |    return;
++         |  }
++         |
++         |  ${matchedKeyVars.map(_.code).mkString("\n")}
++         |  $leftBuffer.add($leftInputRow.copy());
++         |  $rightBuffer.add($rightInputRow.copy());
++         |  $leftInputRow = null;
++         |  $rightInputRow = null;
++         |
++         |  // Buffer rows from both sides with same join key
++         |  while (leftIter.hasNext()) {
++         |    $leftInputRow = (InternalRow) leftIter.next();
++         |    ${leftMatchedKeyVars.map(_.code).mkString("\n")}
++         |    ${genComparison(ctx, leftMatchedKeyVars, matchedKeyVars)}
++         |    if (comp == 0) {
++         |
++         |      $leftBuffer.add($leftInputRow.copy());
++         |      $leftInputRow = null;
++         |    } else {
++         |      break;
++         |    }
++         |  }
++         |  while (rightIter.hasNext()) {
++         |    $rightInputRow = (InternalRow) rightIter.next();
++         |    ${rightMatchedKeyVars.map(_.code).mkString("\n")}
++         |    ${genComparison(ctx, rightMatchedKeyVars, matchedKeyVars)}
++         |    if (comp == 0) {
++         |      $rightBuffer.add($rightInputRow.copy());
++         |      $rightInputRow = null;
++         |    } else {
++         |      break;
++         |    }
++         |  }
++         |
++         |  // Reset bit sets of buffers accordingly
++         |  if ($leftBuffer.size() <= $leftMatched.capacity()) {
++         |    $leftMatched.clearUntil($leftBuffer.size());
++         |  } else {
++         |    $leftMatched = new $matchedClsName($leftBuffer.size());
++         |  }
++         |  if ($rightBuffer.size() <= $rightMatched.capacity()) {
++         |    $rightMatched.clearUntil($rightBuffer.size());
++         |  } else {
++         |    $rightMatched = new $matchedClsName($rightBuffer.size());
++         |  }
++         |}
++       """.stripMargin)
++
++    // Scan the left and right buffers to find all matched rows.
++    val matchRowsInBuffer =
++      s"""
++         |int $leftIndex;
++         |int $rightIndex;
++         |
++         |for ($leftIndex = 0; $leftIndex < $leftBuffer.size(); $leftIndex++) {
++         |  $leftOutputRow = (InternalRow) $leftBuffer.get($leftIndex);
++         |  for ($rightIndex = 0; $rightIndex < $rightBuffer.size(); $rightIndex++) {
++         |    $rightOutputRow = (InternalRow) $rightBuffer.get($rightIndex);
++         |    $conditionCheck {
++         |      $consumeFullOuterJoinRow();
++         |      $leftMatched.set($leftIndex);
++         |      $rightMatched.set($rightIndex);
++         |    }
++         |  }
++         |
++         |  if (!$leftMatched.get($leftIndex)) {
++         |
++         |    $rightOutputRow = null;
++         |    $consumeFullOuterJoinRow();
++         |  }
++         |}
++         |
++         |$leftOutputRow = null;
++         |for ($rightIndex = 0; $rightIndex < $rightBuffer.size(); $rightIndex++) {
++         |  if (!$rightMatched.get($rightIndex)) {
++         |    // The right row has never matched any left row, join it with null row
++         |    $rightOutputRow = (InternalRow) $rightBuffer.get($rightIndex);
++         |    $consumeFullOuterJoinRow();
++         |  }
++         |}
++       """.stripMargin
++
++    s"""
++       |while (($leftInputRow != null || $leftInput.hasNext()) &&
++       |  ($rightInputRow != null || $rightInput.hasNext())) {
++       |  $findNextJoinRowsFuncName($leftInput, $rightInput);
++       |  $matchRowsInBuffer
++       |  if (shouldStop()) return;
++       |}
++       |
++       |// The right iterator has no more rows, join left row with null
++       |while ($leftInputRow != null || $leftInput.hasNext()) {
++       |  if ($leftInputRow == null) {
++       |    $leftInputRow = (InternalRow) $leftInput.next();
++       |  }
++       |  $outputLeftNoMatch
++       |  if (shouldStop()) return;
++       |}
++       |
++       |// The left iterator has no more rows, join right row with null
++       |while ($rightInputRow != null || $rightInput.hasNext()) {
++       |  if ($rightInputRow == null) {
++       |    $rightInputRow = (InternalRow) $rightInput.next();
++       |  }
++       |  $outputRightNoMatch
++       |  if (shouldStop()) return;
++       |}
++     """.stripMargin
++  }
++}
++
++/**
++ * Helper class that is used to implement [[SortMergeJoinExec]].
++ *
++ * To perform an inner (outer) join, users of this class call [[findNextInnerJoinRows()]]
++ * ([[findNextOuterJoinRows()]]), which returns `true` if a result has been produced and `false`
++ * otherwise. If a result has been produced, then the caller may call [[getStreamedRow]] to return
++ * the matching row from the streamed input and may call [[getBufferedMatches]] to return the
++ * sequence of matching rows from the buffered input (in the case of an outer join, this will return
++ * an empty sequence if there are no matches from the buffered input). For efficiency, both of these
++ * methods return mutable objects which are re-used across calls to the `findNext*JoinRows()`
++ * methods.
++ *
++ * @param streamedKeyGenerator a projection that produces join keys from the streamed input.
++ * @param bufferedKeyGenerator a projection that produces join keys from the buffered input.
++ * @param keyOrdering an ordering which can be used to compare join keys.
++ * @param streamedIter an input whose rows will be streamed.
++ * @param bufferedIter an input whose rows will be buffered to construct sequences of rows that
++ *                     have the same join key.
++ * @param inMemoryThreshold Threshold for number of rows guaranteed to be held in memory by
++ *                          internal buffer
++ * @param spillThreshold Threshold for number of rows to be spilled by internal buffer
++ * @param eagerCleanupResources the eager cleanup function to be invoked when no join row found
++ * @param onlyBufferFirstMatch [[bufferMatchingRows]] should buffer only the first matching row
++ */
++private[joins] class SortMergeJoinScanner(
++                                           streamedKeyGenerator: Projection,
++                                           bufferedKeyGenerator: Projection,
++                                           keyOrdering: Ordering[InternalRow],
++                                           streamedIter: RowIterator,
++                                           bufferedIter: RowIterator,
++                                           inMemoryThreshold: Int,
++                                           spillThreshold: Int,
++                                           eagerCleanupResources: () => Unit,
++                                           onlyBufferFirstMatch: Boolean = false) {
++  private[this] var streamedRow: InternalRow = _
++  private[this] var streamedRowKey: InternalRow = _
++  private[this] var bufferedRow: InternalRow = _
++  // Note: this is guaranteed to never have any null columns:
++  private[this] var bufferedRowKey: InternalRow = _
++  /**
++   * The join key for the rows buffered in `bufferedMatches`, or null if `bufferedMatches` is empty
++   */
++  private[this] var matchJoinKey: InternalRow = _
++  /** Buffered rows from the buffered side of the join. This is empty if there are no matches. */
++  private[this] val bufferedMatches: ExternalAppendOnlyUnsafeRowArray =
++    new ExternalAppendOnlyUnsafeRowArray(if (onlyBufferFirstMatch) 1 else inMemoryThreshold,
++      spillThreshold)
++
++  // Initialization (note: do _not_ want to advance streamed here).
++  advancedBufferedToRowWithNullFreeJoinKey()
++
++  // --- Public methods ---------------------------------------------------------------------------
++
++  def getStreamedRow: InternalRow = streamedRow
++
++  def getBufferedMatches: ExternalAppendOnlyUnsafeRowArray = bufferedMatches
++
++  /**
++   * Advances both input iterators, stopping when we have found rows with matching join keys. If no
++   * join rows found, try to do the eager resources cleanup.
++   * @return true if matching rows have been found and false otherwise. If this returns true, then
++   *         [[getStreamedRow]] and [[getBufferedMatches]] can be called to construct the join
++   *         results.
++   */
++  final def findNextInnerJoinRows(): Boolean = {
++    while (advancedStreamed() && streamedRowKey.anyNull) {
++      // Advance the streamed side of the join until we find the next row whose join key contains
++      // no nulls or we hit the end of the streamed iterator.
++    }
++    val found = if (streamedRow == null) {
++      // We have consumed the entire streamed iterator, so there can be no more matches.
++      matchJoinKey = null
++      bufferedMatches.clear()
++      false
++    } else if (matchJoinKey != null && keyOrdering.compare(streamedRowKey, matchJoinKey) == 0) {
++      // The new streamed row has the same join key as the previous row, so return the same matches.
++      true
++    } else if (bufferedRow == null) {
++      // The streamed row's join key does not match the current batch of buffered rows and there are
++      // no more rows to read from the buffered iterator, so there can be no more matches.
++      matchJoinKey = null
++      bufferedMatches.clear()
++      false
++    } else {
++      // Advance both the streamed and buffered iterators to find the next pair of matching rows.
++      var comp = keyOrdering.compare(streamedRowKey, bufferedRowKey)
++      do {
++        if (streamedRowKey.anyNull) {
++          advancedStreamed()
++        } else {
++          assert(!bufferedRowKey.anyNull)
++          comp = keyOrdering.compare(streamedRowKey, bufferedRowKey)
++          if (comp > 0) advancedBufferedToRowWithNullFreeJoinKey()
++          else if (comp < 0) advancedStreamed()
++        }
++      } while (streamedRow != null && bufferedRow != null && comp != 0)
++      if (streamedRow == null || bufferedRow == null) {
++        // We have either hit the end of one of the iterators, so there can be no more matches.
++        matchJoinKey = null
++        bufferedMatches.clear()
++        false
++      } else {
++        // The streamed row's join key matches the current buffered row's join, so walk through the
++        // buffered iterator to buffer the rest of the matching rows.
++        assert(comp == 0)
++        bufferMatchingRows()
++        true
++      }
++    }
++    if (!found) eagerCleanupResources()
++    found
++  }
++
++  /**
++   * Advances the streamed input iterator and buffers all rows from the buffered input that
++   * have matching keys. If no join rows found, try to do the eager resources cleanup.
++   * @return true if the streamed iterator returned a row, false otherwise. If this returns true,
++   *         then [[getStreamedRow]] and [[getBufferedMatches]] can be called to produce the outer
++   *         join results.
++   */
++  final def findNextOuterJoinRows(): Boolean = {
++    val found = if (!advancedStreamed()) {
++      // We have consumed the entire streamed iterator, so there can be no more matches.
++      matchJoinKey = null
++      bufferedMatches.clear()
++      false
++    } else {
++      if (matchJoinKey != null && keyOrdering.compare(streamedRowKey, matchJoinKey) == 0) {
++        // Matches the current group, so do nothing.
++      } else {
++        // The streamed row does not match the current group.
++        matchJoinKey = null
++        bufferedMatches.clear()
++        if (bufferedRow != null && !streamedRowKey.anyNull) {
++          // The buffered iterator could still contain matching rows, so we'll need to walk through
++          // it until we either find matches or pass where they would be found.
++          var comp = 1
++          do {
++            comp = keyOrdering.compare(streamedRowKey, bufferedRowKey)
++          } while (comp > 0 && advancedBufferedToRowWithNullFreeJoinKey())
++          if (comp == 0) {
++            // We have found matches, so buffer them (this updates matchJoinKey)
++            bufferMatchingRows()
++          } else {
++            // We have overshot the position where the row would be found, hence no matches.
++          }
++        }
++      }
++      // If there is a streamed input then we always return true
++      true
++    }
++    if (!found) eagerCleanupResources()
++    found
++  }
++
++  // --- Private methods --------------------------------------------------------------------------
++
++  /**
++   * Advance the streamed iterator and compute the new row's join key.
++   * @return true if the streamed iterator returned a row and false otherwise.
++   */
++  private def advancedStreamed(): Boolean = {
++    if (streamedIter.advanceNext()) {
++      streamedRow = streamedIter.getRow
++      streamedRowKey = streamedKeyGenerator(streamedRow)
++      true
++    } else {
++      streamedRow = null
++      streamedRowKey = null
++      false
++    }
++  }
++
++  /**
++   * Advance the buffered iterator until we find a row with join key that does not contain nulls.
++   * @return true if the buffered iterator returned a row and false otherwise.
++   */
++  private def advancedBufferedToRowWithNullFreeJoinKey(): Boolean = {
++    var foundRow: Boolean = false
++    while (!foundRow && bufferedIter.advanceNext()) {
++      bufferedRow = bufferedIter.getRow
++      bufferedRowKey = bufferedKeyGenerator(bufferedRow)
++      foundRow = !bufferedRowKey.anyNull
++    }
++    if (!foundRow) {
++      bufferedRow = null
++      bufferedRowKey = null
++      false
++    } else {
++      true
++    }
++  }
++
++  /**
++   * Called when the streamed and buffered join keys match in order to buffer the matching rows.
++   */
++  private def bufferMatchingRows(): Unit = {
++    assert(streamedRowKey != null)
++    assert(!streamedRowKey.anyNull)
++    assert(bufferedRowKey != null)
++    assert(!bufferedRowKey.anyNull)
++    assert(keyOrdering.compare(streamedRowKey, bufferedRowKey) == 0)
++    // This join key may have been produced by a mutable projection, so we need to make a copy:
++    matchJoinKey = streamedRowKey.copy()
++    bufferedMatches.clear()
++    do {
++      if (!onlyBufferFirstMatch || bufferedMatches.isEmpty) {
++        bufferedMatches.add(bufferedRow.asInstanceOf[UnsafeRow])
++      }
++      advancedBufferedToRowWithNullFreeJoinKey()
++    } while (bufferedRow != null && keyOrdering.compare(streamedRowKey, bufferedRowKey) == 0)
++  }
++}
++
++/**
++ * An iterator for outputting rows in left outer join.
++ */
++private class LeftOuterIterator(
++                                 smjScanner: SortMergeJoinScanner,
++                                 rightNullRow: InternalRow,
++                                 boundCondition: InternalRow => Boolean,
++                                 resultProj: InternalRow => InternalRow,
++                                 numOutputRows: SQLMetric)
++  extends OneSideOuterIterator(
++    smjScanner, rightNullRow, boundCondition, resultProj, numOutputRows) {
++
++  protected override def setStreamSideOutput(row: InternalRow): Unit = joinedRow.withLeft(row)
++  protected override def setBufferedSideOutput(row: InternalRow): Unit = joinedRow.withRight(row)
++}
++
++/**
++ * An iterator for outputting rows in right outer join.
++ */
++private class RightOuterIterator(
++                                  smjScanner: SortMergeJoinScanner,
++                                  leftNullRow: InternalRow,
++                                  boundCondition: InternalRow => Boolean,
++                                  resultProj: InternalRow => InternalRow,
++                                  numOutputRows: SQLMetric)
++  extends OneSideOuterIterator(smjScanner, leftNullRow, boundCondition, resultProj, numOutputRows) {
++
++  protected override def setStreamSideOutput(row: InternalRow): Unit = joinedRow.withRight(row)
++  protected override def setBufferedSideOutput(row: InternalRow): Unit = joinedRow.withLeft(row)
++}
++
++/**
++ * An abstract iterator for sharing code between [[LeftOuterIterator]] and [[RightOuterIterator]].
++ *
++ * Each [[OneSideOuterIterator]] has a streamed side and a buffered side. Each row on the
++ * streamed side will output 0 or many rows, one for each matching row on the buffered side.
++ * If there are no matches, then the buffered side of the joined output will be a null row.
++ *
++ * In left outer join, the left is the streamed side and the right is the buffered side.
++ * In right outer join, the right is the streamed side and the left is the buffered side.
++ *
++ * @param smjScanner a scanner that streams rows and buffers any matching rows
++ * @param bufferedSideNullRow the default row to return when a streamed row has no matches
++ * @param boundCondition an additional filter condition for buffered rows
++ * @param resultProj how the output should be projected
++ * @param numOutputRows an accumulator metric for the number of rows output
++ */
++private abstract class OneSideOuterIterator(
++                                             smjScanner: SortMergeJoinScanner,
++                                             bufferedSideNullRow: InternalRow,
++                                             boundCondition: InternalRow => Boolean,
++                                             resultProj: InternalRow => InternalRow,
++                                             numOutputRows: SQLMetric) extends RowIterator {
++
++  // A row to store the joined result, reused many times
++  protected[this] val joinedRow: JoinedRow = new JoinedRow()
++
++  // Index of the buffered rows, reset to 0 whenever we advance to a new streamed row
++  private[this] var rightMatchesIterator: Iterator[UnsafeRow] = null
++
++  // This iterator is initialized lazily so there should be no matches initially
++  assert(smjScanner.getBufferedMatches.length == 0)
++
++  // Set output methods to be overridden by subclasses
++  protected def setStreamSideOutput(row: InternalRow): Unit
++  protected def setBufferedSideOutput(row: InternalRow): Unit
++
++  /**
++   * Advance to the next row on the stream side and populate the buffer with matches.
++   * @return whether there are more rows in the stream to consume.
++   */
++  private def advanceStream(): Boolean = {
++    rightMatchesIterator = null
++    if (smjScanner.findNextOuterJoinRows()) {
++      setStreamSideOutput(smjScanner.getStreamedRow)
++      if (smjScanner.getBufferedMatches.isEmpty) {
++        // There are no matching rows in the buffer, so return the null row
++        setBufferedSideOutput(bufferedSideNullRow)
++      } else {
++        // Find the next row in the buffer that satisfied the bound condition
++        if (!advanceBufferUntilBoundConditionSatisfied()) {
++          setBufferedSideOutput(bufferedSideNullRow)
++        }
++      }
++      true
++    } else {
++      // Stream has been exhausted
++      false
++    }
++  }
++
++  /**
++   * Advance to the next row in the buffer that satisfies the bound condition.
++   * @return whether there is such a row in the current buffer.
++   */
++  private def advanceBufferUntilBoundConditionSatisfied(): Boolean = {
++    var foundMatch: Boolean = false
++    if (rightMatchesIterator == null) {
++      rightMatchesIterator = smjScanner.getBufferedMatches.generateIterator()
++    }
++
++    while (!foundMatch && rightMatchesIterator.hasNext) {
++      setBufferedSideOutput(rightMatchesIterator.next())
++      foundMatch = boundCondition(joinedRow)
++    }
++    foundMatch
++  }
++
++  override def advanceNext(): Boolean = {
++    val r = advanceBufferUntilBoundConditionSatisfied() || advanceStream()
++    if (r) numOutputRows += 1
++    r
++  }
++
++  override def getRow: InternalRow = resultProj(joinedRow)
++}
++
++private class SortMergeFullOuterJoinScanner(
++                                             leftKeyGenerator: Projection,
++                                             rightKeyGenerator: Projection,
++                                             keyOrdering: Ordering[InternalRow],
++                                             leftIter: RowIterator,
++                                             rightIter: RowIterator,
++                                             boundCondition: InternalRow => Boolean,
++                                             leftNullRow: InternalRow,
++                                             rightNullRow: InternalRow)  {
++  private[this] val joinedRow: JoinedRow = new JoinedRow()
++  private[this] var leftRow: InternalRow = _
++  private[this] var leftRowKey: InternalRow = _
++  private[this] var rightRow: InternalRow = _
++  private[this] var rightRowKey: InternalRow = _
++
++  private[this] var leftIndex: Int = 0
++  private[this] var rightIndex: Int = 0
++  private[this] val leftMatches: ArrayBuffer[InternalRow] = new ArrayBuffer[InternalRow]
++  private[this] val rightMatches: ArrayBuffer[InternalRow] = new ArrayBuffer[InternalRow]
++  private[this] var leftMatched: BitSet = new BitSet(1)
++  private[this] var rightMatched: BitSet = new BitSet(1)
++
++  advancedLeft()
++  advancedRight()
++
++  // --- Private methods --------------------------------------------------------------------------
++
++  /**
++   * Advance the left iterator and compute the new row's join key.
++   * @return true if the left iterator returned a row and false otherwise.
++   */
++  private def advancedLeft(): Boolean = {
++    if (leftIter.advanceNext()) {
++      leftRow = leftIter.getRow
++      leftRowKey = leftKeyGenerator(leftRow)
++      true
++    } else {
++      leftRow = null
++      leftRowKey = null
++      false
++    }
++  }
++
++  /**
++   * Advance the right iterator and compute the new row's join key.
++   * @return true if the right iterator returned a row and false otherwise.
++   */
++  private def advancedRight(): Boolean = {
++    if (rightIter.advanceNext()) {
++      rightRow = rightIter.getRow
++      rightRowKey = rightKeyGenerator(rightRow)
++      true
++    } else {
++      rightRow = null
++      rightRowKey = null
++      false
++    }
++  }
++
++  /**
++   * Populate the left and right buffers with rows matching the provided key.
++   * This consumes rows from both iterators until their keys are different from the matching key.
++   */
++  private def findMatchingRows(matchingKey: InternalRow): Unit = {
++    leftMatches.clear()
++    rightMatches.clear()
++    leftIndex = 0
++    rightIndex = 0
++
++    while (leftRowKey != null && keyOrdering.compare(leftRowKey, matchingKey) == 0) {
++      leftMatches += leftRow.copy()
++      advancedLeft()
++    }
++    while (rightRowKey != null && keyOrdering.compare(rightRowKey, matchingKey) == 0) {
++      rightMatches += rightRow.copy()
++      advancedRight()
++    }
++
++    if (leftMatches.size <= leftMatched.capacity) {
++      leftMatched.clearUntil(leftMatches.size)
++    } else {
++      leftMatched = new BitSet(leftMatches.size)
++    }
++    if (rightMatches.size <= rightMatched.capacity) {
++      rightMatched.clearUntil(rightMatches.size)
++    } else {
++      rightMatched = new BitSet(rightMatches.size)
++    }
++  }
++
++  /**
++   * Scan the left and right buffers for the next valid match.
++   *
++   * Note: this method mutates `joinedRow` to point to the latest matching rows in the buffers.
++   * If a left row has no valid matches on the right, or a right row has no valid matches on the
++   * left, then the row is joined with the null row and the result is considered a valid match.
++   *
++   * @return true if a valid match is found, false otherwise.
++   */
++  private def scanNextInBuffered(): Boolean = {
++    while (leftIndex < leftMatches.size) {
++      while (rightIndex < rightMatches.size) {
++        joinedRow(leftMatches(leftIndex), rightMatches(rightIndex))
++        if (boundCondition(joinedRow)) {
++          leftMatched.set(leftIndex)
++          rightMatched.set(rightIndex)
++          rightIndex += 1
++          return true
++        }
++        rightIndex += 1
++      }
++      rightIndex = 0
++      if (!leftMatched.get(leftIndex)) {
++        // the left row has never matched any right row, join it with null row
++        joinedRow(leftMatches(leftIndex), rightNullRow)
++        leftIndex += 1
++        return true
++      }
++      leftIndex += 1
++    }
++
++    while (rightIndex < rightMatches.size) {
++      if (!rightMatched.get(rightIndex)) {
++        // the right row has never matched any left row, join it with null row
++        joinedRow(leftNullRow, rightMatches(rightIndex))
++        rightIndex += 1
++        return true
++      }
++      rightIndex += 1
++    }
++
++    // There are no more valid matches in the left and right buffers
++    false
++  }
++
++  // --- Public methods --------------------------------------------------------------------------
++
++  def getJoinedRow(): JoinedRow = joinedRow
++
++  def advanceNext(): Boolean = {
++    // If we already buffered some matching rows, use them directly
++    if (leftIndex <= leftMatches.size || rightIndex <= rightMatches.size) {
++      if (scanNextInBuffered()) {
++        return true
++      }
++    }
++
++    if (leftRow != null && (leftRowKey.anyNull || rightRow == null)) {
++      joinedRow(leftRow.copy(), rightNullRow)
++      advancedLeft()
++      true
++    } else if (rightRow != null && (rightRowKey.anyNull || leftRow == null)) {
++      joinedRow(leftNullRow, rightRow.copy())
++      advancedRight()
++      true
++    } else if (leftRow != null && rightRow != null) {
++      // Both rows are present and neither have null values,
++      // so we populate the buffers with rows matching the next key
++      val comp = keyOrdering.compare(leftRowKey, rightRowKey)
++      if (comp <= 0) {
++        findMatchingRows(leftRowKey.copy())
++      } else {
++        findMatchingRows(rightRowKey.copy())
++      }
++      scanNextInBuffered()
++      true
++    } else {
++      // Both iterators have been consumed
++      false
++    }
++  }
++}
++
++private class FullOuterIterator(
++                                 smjScanner: SortMergeFullOuterJoinScanner,
++                                 resultProj: InternalRow => InternalRow,
++                                 numRows: SQLMetric) extends RowIterator {
++  private[this] val joinedRow: JoinedRow = smjScanner.getJoinedRow()
++
++  override def advanceNext(): Boolean = {
++    val r = smjScanner.advanceNext()
++    if (r) numRows += 1
++    r
++  }
++
++  override def getRow: InternalRow = resultProj(joinedRow)
++}
+\ No newline at end of file
+diff --git a/lakesoul-spark/src/main/scala/org/apache/spark/sql/lakesoul/TransactionCommit.scala b/lakesoul-spark/src/main/scala/org/apache/spark/sql/lakesoul/TransactionCommit.scala
+index 4dd5785..407b515 100644
+--- a/lakesoul-spark/src/main/scala/org/apache/spark/sql/lakesoul/TransactionCommit.scala
++++ b/lakesoul-spark/src/main/scala/org/apache/spark/sql/lakesoul/TransactionCommit.scala
+@@ -25,10 +25,12 @@ import org.apache.spark.sql.execution.datasources.parquet.ParquetSchemaConverter
+ import org.apache.spark.sql.lakesoul.exception.MetaRerunException
+ import org.apache.spark.sql.lakesoul.schema.SchemaUtils
+ import org.apache.spark.sql.lakesoul.utils._
++import org.apache.spark.util.ThreadUtils
+ 
+ import java.util.{ConcurrentModificationException, UUID}
+ import scala.collection.mutable
+ import scala.collection.mutable.ArrayBuffer
++import scala.concurrent.ExecutionContext
+ 
+ class TransactionCommit(override val snapshotManagement: SnapshotManagement) extends Transaction {
+ 
+@@ -61,6 +63,10 @@ object TransactionCommit {
+   private[lakesoul] def clearActive(): Unit = {
+     active.set(null)
+   }
++
++  private[lakesoul] val bulkExecCtx = ExecutionContext.fromExecutorService(
++    ThreadUtils.newDaemonCachedThreadPool("BulkExec", 4, 500)
++  )
+ }
+ 
+ class PartMergeTransactionCommit(override val snapshotManagement: SnapshotManagement) extends Transaction {
+diff --git a/lakesoul-spark/src/main/scala/org/apache/spark/sql/lakesoul/TransactionalWrite.scala b/lakesoul-spark/src/main/scala/org/apache/spark/sql/lakesoul/TransactionalWrite.scala
+index d070edb..7aa517a 100644
+--- a/lakesoul-spark/src/main/scala/org/apache/spark/sql/lakesoul/TransactionalWrite.scala
++++ b/lakesoul-spark/src/main/scala/org/apache/spark/sql/lakesoul/TransactionalWrite.scala
+@@ -21,14 +21,17 @@ import org.apache.hadoop.fs.Path
+ import org.apache.spark.sql.Dataset
+ import org.apache.spark.sql.catalyst.catalog.BucketSpec
+ import org.apache.spark.sql.catalyst.expressions.Attribute
++import org.apache.spark.sql.execution.datasources.parquet.ParquetFileFormat
+ import org.apache.spark.sql.execution.datasources.{BasicWriteJobStatsTracker, FileFormatWriter, WriteJobStatsTracker}
++import org.apache.spark.sql.execution.exchange.Exchange
++import org.apache.spark.sql.execution.joins.SortMergeJoinExec
+ import org.apache.spark.sql.execution.{QueryExecution, SQLExecution}
+ import org.apache.spark.sql.functions.col
+ import org.apache.spark.sql.internal.SQLConf
+ import org.apache.spark.sql.lakesoul.exception.LakeSoulErrors
+ import org.apache.spark.sql.lakesoul.schema.{InvariantCheckerExec, Invariants, SchemaUtils}
+ import org.apache.spark.sql.lakesoul.sources.LakeSoulSQLConf
+-import org.apache.spark.sql.lakesoul.utils.{DataFileInfo, SparkUtil}
++import org.apache.spark.sql.lakesoul.utils.{DataFileInfo, SparkUtil, TableInfo}
+ import org.apache.spark.sql.types.StructType
+ import org.apache.spark.util.SerializableConfiguration
+ 
+@@ -210,3 +213,141 @@ trait TransactionalWrite {
+ 
+ 
+ }
++
++object TransactionalWrite {
++
++  /**
++   * Normalize the schema of the query, and return the QueryExecution to execute. The output
++   * attributes of the QueryExecution may not match the attributes we return as the output schema.
++   * This is because streaming queries create `IncrementalExecution`, which cannot be further
++   * modified. We can however have the Parquet writer use the physical plan from
++   * `IncrementalExecution` and the output schema provided through the attributes.
++   */
++  protected def normalizeData(data: Dataset[_], tableInfo: TableInfo):
++  (QueryExecution, Seq[Attribute]) = {
++    val normalizedData = SchemaUtils.normalizeColumnNames(tableInfo.schema, data)
++    val cleanedData = SchemaUtils.dropNullTypeColumns(normalizedData)
++    val queryExecution = if (cleanedData.schema != normalizedData.schema) {
++      // For batch executions, we need to use the latest DataFrame query execution
++      cleanedData.queryExecution
++    } else {
++      // For streaming workloads, we need to use the QueryExecution created from StreamExecution
++      data.queryExecution
++    }
++    queryExecution -> cleanedData.queryExecution.analyzed.output
++  }
++
++  protected def getPartitioningColumns(rangePartitionSchema: StructType,
++                                       hashPartitionSchema: StructType,
++                                       output: Seq[Attribute],
++                                       colsDropped: Boolean): Seq[Attribute] = {
++    val rangePartitionColumns: Seq[Attribute] = rangePartitionSchema.map { col =>
++      // schema is already normalized, therefore we can do an equality check
++      output.find(f => f.name == col.name)
++        .getOrElse {
++          throw LakeSoulErrors.partitionColumnNotFoundException(col.name, output)
++        }
++    }
++    val hashPartitionColumns: Seq[Attribute] = hashPartitionSchema.map { col =>
++      // schema is already normalized, therefore we can do an equality check
++      output.find(f => f.name == col.name)
++        .getOrElse {
++          throw LakeSoulErrors.partitionColumnNotFoundException(col.name, output)
++        }
++    }
++
++    val partitionColumns = rangePartitionColumns ++ hashPartitionColumns
++
++    if (partitionColumns.nonEmpty && partitionColumns.length == output.length) {
++      throw LakeSoulErrors.nonPartitionColumnAbsentException(colsDropped)
++    }
++    rangePartitionColumns
++  }
++
++  /**
++   * Writes out the dataframe after performing schema validation. Returns a list of
++   * actions to append these files to the reservoir.
++   */
++  def writeFiles(oriData: Dataset[_],
++                 tableInfo: TableInfo): (Seq[DataFileInfo], Path) = {
++    val data = if (tableInfo.hash_partition_columns.nonEmpty &&
++        oriData.queryExecution.executedPlan.find(_.isInstanceOf[SortMergeJoinExec]).isEmpty) {
++      oriData.repartition(tableInfo.bucket_num, tableInfo.hash_partition_columns.map(col): _*)
++    } else {
++      oriData
++    }
++
++    val spark = data.sparkSession
++    spark.sessionState.conf.setConfString(SQLConf.UNSUPPORTED_OPERATION_CHECK_ENABLED.key, "false")
++
++
++    val rangePartitionSchema = tableInfo.range_partition_schema
++    val hashPartitionSchema = tableInfo.hash_partition_schema
++    val outputPath = SparkUtil.makeQualifiedTablePath(tableInfo.table_path)
++
++    val (queryExecution, output) = normalizeData(data, tableInfo)
++    val partitioningColumns =
++      getPartitioningColumns(
++        rangePartitionSchema,
++        hashPartitionSchema,
++        output,
++        output.length < data.schema.size)
++
++    val committer = new DelayedCommitProtocol("lakesoul", outputPath.toString, None)
++
++    //add not null check to primary key
++    val invariants = Invariants.getFromSchema(tableInfo.schema, spark)
++
++    SQLExecution.withNewExecutionId(queryExecution) {
++      val outputSpec = FileFormatWriter.OutputSpec(
++        outputPath.toString,
++        Map.empty,
++        output)
++
++      val physicalPlan = InvariantCheckerExec(queryExecution.executedPlan, invariants)
++
++      val statsTrackers: ListBuffer[WriteJobStatsTracker] = ListBuffer()
++
++      val basicWriteJobStatsTracker = new BasicWriteJobStatsTracker(
++        new SerializableConfiguration(spark.sessionState.newHadoopConf()),
++        BasicWriteJobStatsTracker.metrics)
++      statsTrackers.append(basicWriteJobStatsTracker)
++
++
++      val hashBucketSpec = tableInfo.hash_column match {
++        case "" => None
++        case _ => Option(BucketSpec(tableInfo.bucket_num,
++          tableInfo.hash_partition_columns,
++          tableInfo.hash_partition_columns))
++      }
++
++      val sqlConf = spark.sessionState.conf
++      val writeOptions = new mutable.HashMap[String, String]()
++      if (sqlConf.getConf(LakeSoulSQLConf.PARQUET_COMPRESSION_ENABLE)) {
++        writeOptions.put("compression", sqlConf.getConf(LakeSoulSQLConf.PARQUET_COMPRESSION))
++      } else {
++        writeOptions.put("compression", "uncompressed")
++      }
++
++      //      Map("parquet.block.size" -> spark.sessionState.conf.getConf(LakeSoulSQLConf.PARQUET_BLOCK_SIZE).toString)
++
++      FileFormatWriter.write(
++        sparkSession = spark,
++        plan = physicalPlan,
++        fileFormat = new ParquetFileFormat(), // TODO doesn't support changing formats.
++        committer = committer,
++        outputSpec = outputSpec,
++        hadoopConf = spark.sessionState.newHadoopConfWithOptions(tableInfo.configuration),
++        partitionColumns = partitioningColumns,
++        bucketSpec = hashBucketSpec,
++        statsTrackers = statsTrackers,
++        options = writeOptions.toMap)
++    }
++    val partitionCols = tableInfo.range_partition_columns
++    //Returns the absolute path to the file
++    val real_write_cols = data.schema.fieldNames.filter(!partitionCols.contains(_)).mkString(",")
++    (committer.addedStatuses.map(file => file.copy(
++      file_exist_cols = real_write_cols
++    )), outputPath)
++  }
++}
+diff --git a/lakesoul-spark/src/main/scala/org/apache/spark/sql/lakesoul/commands/UpsertCommand.scala b/lakesoul-spark/src/main/scala/org/apache/spark/sql/lakesoul/commands/UpsertCommand.scala
+index d5fff9d..be09e3c 100644
+--- a/lakesoul-spark/src/main/scala/org/apache/spark/sql/lakesoul/commands/UpsertCommand.scala
++++ b/lakesoul-spark/src/main/scala/org/apache/spark/sql/lakesoul/commands/UpsertCommand.scala
+@@ -21,6 +21,10 @@ import org.apache.spark.sql.catalyst.plans.QueryPlan
+ import org.apache.spark.sql.lakesoul._
+ import org.apache.spark.sql.lakesoul.exception.LakeSoulErrors
+ import org.apache.spark.sql.lakesoul.utils.{DataFileInfo, SparkUtil}
++import org.apache.spark.util.ThreadUtils
++
++import scala.concurrent.Future
++import scala.concurrent.duration.Duration
+ //import org.apache.spark.sql.lakesoul.actions.AddFile
+ import org.apache.spark.sql._
+ import org.apache.spark.sql.catalyst.expressions.{Alias, AttributeReference, Literal, NamedExpression, PredicateHelper}
+@@ -194,3 +198,61 @@ case class UpsertCommand(source: LogicalPlan,
+ 
+ }
+ 
++case class BulkUpsertCommand(
++    source: Seq[LogicalPlan],
++    target: LogicalPlan,
++    targetSnapshotManagement: SnapshotManagement) extends RunnableCommand
++  with Command with PredicateHelper with AnalysisHelper with ImplicitMetadataOperation {
++
++  override def innerChildren: Seq[QueryPlan[_]] = Seq(target) ++ source
++
++  private val tableInfo = targetSnapshotManagement.snapshot.getTableInfo
++
++  override val canMergeSchema: Boolean = false
++  override val canOverwriteSchema: Boolean = false
++  override val rangePartitions: String = tableInfo.range_column
++  override val hashPartitions: String = tableInfo.hash_column
++  override val hashBucketNum: Int = tableInfo.bucket_num
++  override val shortTableName: Option[String] = None
++
++  final override def run(spark: SparkSession): Seq[Row] = {
++    require(spark.conf.get(LakeSoulSQLConf.USE_DELTA_FILE))
++    if (target.schema.size != tableInfo.schema.size) {
++      throw LakeSoulErrors.schemaChangedSinceAnalysis(
++        atAnalysis = target.schema, latestSchema = tableInfo.schema)
++    }
++
++    if (tableInfo.hash_column.isEmpty) {
++      throw LakeSoulErrors.hashColumnsIsNullException()
++    }
++
++    val sourceCols = source.head.output.map(_.name.stripPrefix("`").stripSuffix("`"))
++
++    // source schema should have all the partition cols
++    if (!tableInfo.partition_cols.forall(sourceCols.contains)) {
++      throw LakeSoulErrors
++        .partitionColumnNotFoundException(
++          tableInfo.partition_cols.mkString(","),
++          sourceCols.mkString(","))
++    }
++    val externalColumns = sourceCols.filterNot(tableInfo.schema.fieldNames.contains)
++    if (externalColumns.nonEmpty) {
++      throw LakeSoulErrors.columnsNotFoundException(externalColumns)
++    }
++
++    source.map { df =>
++      Future {
++        TransactionalWrite.writeFiles(Dataset.ofRows(spark, df), tableInfo)
++      }(TransactionCommit.bulkExecCtx)
++    }.foreach { f =>
++      val files = ThreadUtils.awaitResult(f, Duration.Inf)
++      targetSnapshotManagement.withNewTransaction { tc =>
++        tc.setCommitType("merge")
++        tc.commit(files._1, Seq.empty[DataFileInfo])
++      }
++    }
++
++    spark.sharedState.cacheManager.recacheByPlan(spark, target)
++    Seq.empty[Row]
++  }
++}
+diff --git a/lakesoul-spark/src/main/scala/org/apache/spark/sql/lakesoul/rules/PreprocessTableUpsert.scala b/lakesoul-spark/src/main/scala/org/apache/spark/sql/lakesoul/rules/PreprocessTableUpsert.scala
+index 51b42af..bb2ee92 100644
+--- a/lakesoul-spark/src/main/scala/org/apache/spark/sql/lakesoul/rules/PreprocessTableUpsert.scala
++++ b/lakesoul-spark/src/main/scala/org/apache/spark/sql/lakesoul/rules/PreprocessTableUpsert.scala
+@@ -23,7 +23,7 @@ import org.apache.spark.sql.catalyst.plans.logical._
+ import org.apache.spark.sql.catalyst.rules.Rule
+ import org.apache.spark.sql.functions.expr
+ import org.apache.spark.sql.internal.SQLConf
+-import org.apache.spark.sql.lakesoul.commands.UpsertCommand
++import org.apache.spark.sql.lakesoul.commands.{BulkUpsertCommand, UpsertCommand}
+ import org.apache.spark.sql.lakesoul.exception.LakeSoulErrors
+ import org.apache.spark.sql.lakesoul.{LakeSoulTableRelationV2, UpdateExpressionsSupport}
+ 
+@@ -32,6 +32,7 @@ case class PreprocessTableUpsert(sqlConf: SQLConf)
+ 
+   override def apply(plan: LogicalPlan): LogicalPlan = plan.resolveOperators {
+     case m: LakeSoulUpsert if m.resolved => apply(m)
++    case bu: LakeSoulBulkUpsert if bu.resolved => apply(bu)
+   }
+ 
+   def apply(upsert: LakeSoulUpsert): UpsertCommand = {
+@@ -66,4 +67,13 @@ case class PreprocessTableUpsert(sqlConf: SQLConf)
+ 
+     UpsertCommand(source, target, snapshotManagement, condition, migratedSchema)
+   }
++
++  def apply(upsert: LakeSoulBulkUpsert): BulkUpsertCommand = {
++    val LakeSoulBulkUpsert(target, source) = upsert
++    val snapshotManagement = EliminateSubqueryAliases(target) match {
++      case LakeSoulTableRelationV2(tbl) => tbl.snapshotManagement
++      case o => throw LakeSoulErrors.notALakeSoulSourceException("BulkUpsert", Some(o))
++    }
++    BulkUpsertCommand(source, target, snapshotManagement)
++  }
+ }

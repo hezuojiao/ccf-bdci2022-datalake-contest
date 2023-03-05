@@ -1,0 +1,200 @@
+commit 2fd42136afdd9ea311d091eb899fdda86203bf0d
+Author: hezuojiao <hezuojiao@gmail.com>
+Date:   Sun Nov 13 11:45:16 2022 +0800
+
+    submit code
+
+diff --git a/lakesoul/pom.xml b/lakesoul/pom.xml
+index a203b36..8e7a087 100644
+--- a/lakesoul/pom.xml
++++ b/lakesoul/pom.xml
+@@ -38,7 +38,7 @@
+         <dependency>
+             <groupId>com.dmetasoul</groupId>
+             <artifactId>lakesoul-spark</artifactId>
+-            <version>2.1.0-lakesoul-spark-3.1.2-SNAPSHOT</version>
++            <version>2.1.0-spark-3.1.2</version>
+             <scope>compile</scope>
+         </dependency>
+         <dependency>
+diff --git a/lakesoul/src/main/scala/org/ccf/bdci2022/datalake_contest/Read.scala b/lakesoul/src/main/scala/org/ccf/bdci2022/datalake_contest/Read.scala
+index b9f6bac..953e666 100644
+--- a/lakesoul/src/main/scala/org/ccf/bdci2022/datalake_contest/Read.scala
++++ b/lakesoul/src/main/scala/org/ccf/bdci2022/datalake_contest/Read.scala
+@@ -2,6 +2,9 @@ package org.ccf.bdci2022.datalake_contest
+ 
+ import com.dmetasoul.lakesoul.tables.LakeSoulTable
+ import org.apache.spark.sql.SparkSession
++import org.apache.spark.sql.execution.datasources.v2.merge.parquet.batch.merge_operator.{MergeNonNullOp, MergeOpLong}
++import org.apache.spark.sql.functions.expr
++import org.apache.spark.sql.lakesoul.sources.LakeSoulSQLConf
+ 
+ object Read {
+   def main(args: Array[String]): Unit = {
+@@ -19,24 +22,43 @@ object Read {
+       .config("spark.hadoop.fs.s3a.fast.upload.buffer", "disk")
+       .config("spark.hadoop.fs.s3a.fast.upload", value = true)
+       .config("spark.hadoop.fs.s3a.multipart.size", 67108864)
++      .config("spark.hadoop.fs.s3a.connection.maximum", 100)
+       .config("spark.sql.parquet.mergeSchema", value = false)
+       .config("spark.sql.parquet.filterPushdown", value = true)
+-      .config("spark.sql.shuffle.partitions", 10)
++      .config("spark.shuffle.compress", value = false)
++      .config("spark.shuffle.spill.compress", value = false)
++      .config("spark.shuffle.checksum.enabled", value = false)
++      .config("spark.shuffle.detectCorrupt", value = false)
++      .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
++      .config("spark.sql.shuffle.partitions", 4)
+       .config("spark.default.parallelism", 8)
+       .config("spark.sql.files.maxPartitionBytes", "1g")
+       .config("spark.hadoop.mapred.output.committer.class", "org.apache.hadoop.mapred.FileOutputCommitter")
++      .config("spark.hadoop.mapreduce.fileoutputcommitter.algorithm.version", "2")
+       .config("spark.sql.warehouse.dir", "s3://ccf-datalake-contest/datalake_table/")
+       .config("spark.sql.extensions", "com.dmetasoul.lakesoul.sql.LakeSoulSparkSessionExtension")
+       .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.lakesoul.catalog.LakeSoulCatalog")
++      .config("spark.sql.columnVector.offheap.enabled", value = true)
++      .config("spark.sql.parquet.columnarReaderBatchSize", value = 8192)
++      .config(LakeSoulSQLConf.BUCKET_SCAN_MULTI_PARTITION_ENABLE.key, value = true)
++      .config(LakeSoulSQLConf.PART_MERGE_FILE_MINIMUM_NUM.key, value = 100)
+ 
+     if (args.length >= 1 && args(0) == "--localtest")
+       builder.config("spark.hadoop.fs.s3a.endpoint", "http://minio:9000")
+         .config("spark.hadoop.fs.s3a.aws.credentials.provider", "org.apache.hadoop.fs.s3a.AnonymousAWSCredentialsProvider")
+ 
+     val spark = builder.getOrCreate()
++    new MergeOpLong().register(spark, "reqOp")
++    new MergeNonNullOp[String]().register(spark, "nameOp")
++
+     spark.sparkContext.setLogLevel("ERROR")
+     val tablePath= "s3://ccf-datalake-contest/datalake_table"
+     val table = LakeSoulTable.forPath(tablePath)
+-    table.toDF.write.parquet("/opt/spark/work-dir/result/ccf/")
++    table.toDF
++      .select("uuid", "ip", "hostname", "requests", "name", "city", "job", "phonenum")
++      .withColumn("requests", expr("reqOp(requests)"))
++      .withColumn("name", expr("nameOp(name)"))
++      .select("uuid", "ip", "hostname", "requests", "name", "city", "job", "phonenum")
++      .write.parquet("/opt/spark/work-dir/result/ccf/")
+   }
+ }
+diff --git a/lakesoul/src/main/scala/org/ccf/bdci2022/datalake_contest/Write.scala b/lakesoul/src/main/scala/org/ccf/bdci2022/datalake_contest/Write.scala
+index 7b7c975..2a29a1b 100644
+--- a/lakesoul/src/main/scala/org/ccf/bdci2022/datalake_contest/Write.scala
++++ b/lakesoul/src/main/scala/org/ccf/bdci2022/datalake_contest/Write.scala
+@@ -1,7 +1,9 @@
+ package org.ccf.bdci2022.datalake_contest
+ 
+-import org.apache.spark.sql.SparkSession
++import com.dmetasoul.lakesoul.tables.LakeSoulTable
+ import org.apache.spark.sql.functions.{col, when}
++import org.apache.spark.sql.lakesoul.sources.LakeSoulSQLConf
++import org.apache.spark.sql.{DataFrame, Row, SparkSession}
+ 
+ object Write {
+   def main(args: Array[String]): Unit = {
+@@ -19,15 +21,25 @@ object Write {
+       .config("spark.hadoop.fs.s3a.fast.upload.buffer", "disk")
+       .config("spark.hadoop.fs.s3a.fast.upload", value = true)
+       .config("spark.hadoop.fs.s3a.multipart.size", 67108864)
+-      .config("spark.sql.shuffle.partitions", 10)
++      .config("spark.hadoop.fs.s3a.connection.maximum", 100)
++      .config("spark.sql.shuffle.partitions", 4)
+       .config("spark.sql.files.maxPartitionBytes", "1g")
+       .config("spark.default.parallelism", 8)
+       .config("spark.sql.parquet.mergeSchema", value = false)
+       .config("spark.sql.parquet.filterPushdown", value = true)
++      .config("spark.shuffle.compress", value = false)
++      .config("spark.shuffle.spill.compress", value = false)
++      .config("spark.shuffle.checksum.enabled", value = false)
++      .config("spark.shuffle.detectCorrupt", value = false)
++      .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
+       .config("spark.hadoop.mapred.output.committer.class", "org.apache.hadoop.mapred.FileOutputCommitter")
++      .config("spark.hadoop.mapreduce.fileoutputcommitter.algorithm.version", "2")
+       .config("spark.sql.warehouse.dir", "s3://ccf-datalake-contest/datalake_table/")
+       .config("spark.sql.extensions", "com.dmetasoul.lakesoul.sql.LakeSoulSparkSessionExtension")
+       .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.lakesoul.catalog.LakeSoulCatalog")
++      .config("spark.sql.columnVector.offheap.enabled", value = true)
++      .config(LakeSoulSQLConf.BUCKET_SCAN_MULTI_PARTITION_ENABLE.key, value = true)
++      .config(LakeSoulSQLConf.PART_MERGE_FILE_MINIMUM_NUM.key, value = 100)
+ 
+     if (args.length >= 1 && args(0) == "--localtest")
+       builder.config("spark.hadoop.fs.s3a.endpoint", "http://minio:9000")
+@@ -36,37 +48,41 @@ object Write {
+     val spark = builder.getOrCreate()
+     spark.sparkContext.setLogLevel("ERROR")
+ 
+-    val dataPath0 = "/opt/spark/work-dir/data/base-0.parquet"
+-    val dataPath1 = "/opt/spark/work-dir/data/base-1.parquet"
+-    val dataPath2 = "/opt/spark/work-dir/data/base-2.parquet"
+-    val dataPath3 = "/opt/spark/work-dir/data/base-3.parquet"
+-    val dataPath4 = "/opt/spark/work-dir/data/base-4.parquet"
+-    val dataPath5 = "/opt/spark/work-dir/data/base-5.parquet"
+-    val dataPath6 = "/opt/spark/work-dir/data/base-6.parquet"
+-    val dataPath7 = "/opt/spark/work-dir/data/base-7.parquet"
+-    val dataPath8 = "/opt/spark/work-dir/data/base-8.parquet"
+-    val dataPath9 = "/opt/spark/work-dir/data/base-9.parquet"
+-    val dataPath10 = "/opt/spark/work-dir/data/base-10.parquet"
+-
+     val tablePath = "s3://ccf-datalake-contest/datalake_table"
+-    val df = spark.read.format("parquet").load(dataPath0).toDF()
+-    df.write.format("lakesoul").mode("Overwrite").save(tablePath)
++    val dataPath = Seq(
++      "/opt/spark/work-dir/data/base-0.parquet",
++      "/opt/spark/work-dir/data/base-1.parquet",
++      "/opt/spark/work-dir/data/base-2.parquet",
++      "/opt/spark/work-dir/data/base-3.parquet",
++      "/opt/spark/work-dir/data/base-4.parquet",
++      "/opt/spark/work-dir/data/base-5.parquet",
++      "/opt/spark/work-dir/data/base-6.parquet",
++      "/opt/spark/work-dir/data/base-7.parquet",
++      "/opt/spark/work-dir/data/base-8.parquet",
++      "/opt/spark/work-dir/data/base-9.parquet",
++      "/opt/spark/work-dir/data/base-10.parquet"
++    )
++
++    val schema = spark.read.parquet(dataPath.head).schema
++    val df = spark.createDataFrame(spark.sparkContext.emptyRDD[Row], schema)
++    df.write.format("lakesoul")
++      .option("hashPartitions","uuid")
++      .option("hashBucketNum","4")
++      .mode("Overwrite")
++      .save(tablePath)
+ 
+-    overWriteTable(spark, tablePath, dataPath1)
+-    overWriteTable(spark, tablePath, dataPath2)
+-    overWriteTable(spark, tablePath, dataPath3)
+-    overWriteTable(spark, tablePath, dataPath4)
+-    overWriteTable(spark, tablePath, dataPath5)
+-    overWriteTable(spark, tablePath, dataPath6)
+-    overWriteTable(spark, tablePath, dataPath7)
+-    overWriteTable(spark, tablePath, dataPath8)
+-    overWriteTable(spark, tablePath, dataPath9)
+-    overWriteTable(spark, tablePath, dataPath10)
++    val source = dataPath.map(spark.read.parquet(_))
++    val table = LakeSoulTable.forPath(tablePath)
++    val newSource = Seq(
++      source.head,
++      mergeDataFrame(mergeDataFrame(source(1), source(2)), mergeDataFrame(source(3), source(4))),
++      mergeDataFrame(mergeDataFrame(source(5), source(6)), source(7)),
++      mergeDataFrame(mergeDataFrame(source(8), source(9)), source(10))
++    )
++    table.bulkUpsert(newSource)
+   }
+ 
+-  def overWriteTable(spark: SparkSession, tablePath: String, path: String): Unit = {
+-    val df1 = spark.read.format("lakesoul").load(tablePath)
+-    val df2 = spark.read.format("parquet").load(path)
++  private def mergeDataFrame(df1: DataFrame, df2: DataFrame): DataFrame = {
+     df1.join(df2, Seq("uuid"),"full").select(
+       col("uuid"),
+       when(df2("ip").isNotNull, df2("ip")).otherwise(df1("ip")).alias("ip"),
+@@ -76,8 +92,6 @@ object Write {
+       when(df2("name").isNotNull && df2("name").notEqual("null"), df2("name")).otherwise(df1("name")).alias("name"),
+       when(df2("city").isNotNull, df2("city")).otherwise(df1("city")).alias("city"),
+       when(df2("job").isNotNull, df2("job")).otherwise(df1("job")).alias("job"),
+-      when(df2("phonenum").isNotNull, df2("phonenum")).otherwise(df1("phonenum")).alias("phonenum")
+-    ).write.mode("Overwrite").format("lakesoul").save(tablePath)
++      when(df2("phonenum").isNotNull, df2("phonenum")).otherwise(df1("phonenum")).alias("phonenum"))
+   }
+-
+ }
