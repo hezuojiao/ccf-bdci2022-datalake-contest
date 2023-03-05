@@ -7,8 +7,12 @@
 `ccf-bdci2022-datalake-contest` 目录是比赛的提交代码，主要是参数调优和`Partial Merge` ;
 
 
-
 所有代码通过`git`提交，可以使用`git show` 命令跟踪代码修改，进行`code review`。
+
+**更新**:
+提交至github时删除了原项目的git日志，差异点请关注
+https://github.com/hezuojiao/ccf-bdci2022-datalake-contest/blob/main/LakeSoul/ccf-bdci2022-datalake-contest.diff
+https://github.com/hezuojiao/ccf-bdci2022-datalake-contest/blob/main/ccf-bdci2022-datalake-contest/ccf-bdci2022-datalake-contest.diff
 
 ## 2. 方案介绍
 
